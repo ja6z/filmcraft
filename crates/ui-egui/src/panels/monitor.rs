@@ -237,6 +237,9 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which)
     let pic_resp = ui.interact(pic, egui::Id::new((prefix, "pic")), Sense::click());
     app.auto.add(&format!("{prefix}.picture"), pic.intersect(video_area), "picture");
     if show_picture {
+        if !compare {
+            monitor_view::zoom_input(app, ui, which, video_area, pic, frame_size.0 as f32, frame_size.1 as f32, ppp);
+        }
         monitor_view::pan_input(app, ui, which, video_area, pic);
     }
     if which == Which::Program && show_picture {

@@ -15,7 +15,7 @@
 //! `program.compare.<prev|next|set>`, `source.waveform`, and in the dialogs `guides.add.*`,
 //! `guides.save.*`, `guides.manage.*`.
 
-use egui::{Align2, Color32, Rect, Sense, Stroke, Vec2, pos2, vec2};
+use egui::{Align2, Color32, Pos2, Rect, Sense, Stroke, Vec2, pos2, vec2};
 use filmcraft_project::ItemId;
 use filmcraft_time::{Tick, TimeDisplay, format_time};
 use serde_json::{Value, json};
@@ -363,6 +363,58 @@ pub fn pan_input(app: &mut FilmcraftApp, ui: &mut egui::Ui, w: Which, area: Rect
         let max = ((pic.size() - area.size()) / 2.0).max(Vec2::ZERO);
         let v = view_mut(app, w);
         v.pan = [(v.pan[0] + d.x).clamp(-max.x, max.x), (v.pan[1] + d.y).clamp(-max.y, max.y)];
+    }
+}
+
+/// Largest magnification the wheel / pinch reaches (the zoom menu's 1600%).
+const MAX_WHEEL_ZOOM: f32 = 16.0;
+
+/// Zoom by `factor` about `pointer`: the frame pixel under the pointer stays under it.
+///
+/// `pic` is the picture rect drawn this frame for `zoom` (None = Fit). Returns the new
+/// (zoom, pan); zooming out to the fitted size or below returns to Fit. `None` when the
+/// inputs can't describe a picture (zero-sized frame or area, non-finite factor).
+#[allow(clippy::too_many_arguments)]
+pub fn zoom_about(area: Rect, pic: Rect, fw: f32, fh: f32, ppp: f32, zoom: Option<f32>, pointer: Pos2, factor: f32) -> Option<(Option<f32>, [f32; 2])> {
+    if !(factor.is_finite() && factor > 0.0) || fw <= 0.0 || fh <= 0.0 || area.width() <= 0.0 || area.height() <= 0.0 {
+        return None;
+    }
+    let ppp = ppp.max(0.1);
+    // Fit as a magnification: the fitted picture's frame pixels per physical pixel.
+    let fit_zoom = (area.width() / fw).min(area.height() / fh) * ppp;
+    let cur = zoom.unwrap_or(fit_zoom);
+    if !(cur.is_finite() && cur > 0.0) {
+        return None;
+    }
+    let new = (cur * factor).min(MAX_WHEEL_ZOOM.max(fit_zoom));
+    if new <= fit_zoom * 1.0001 {
+        return Some((None, [0.0, 0.0]));
+    }
+    let k = new / cur;
+    let centre = pointer - (pointer - pic.center()) * k;
+    let size = vec2(fw * new / ppp, fh * new / ppp);
+    let max = ((size - area.size()) / 2.0).max(Vec2::ZERO);
+    let pan = centre - area.center();
+    Some((Some(new), [pan.x.clamp(-max.x, max.x), pan.y.clamp(-max.y, max.y)]))
+}
+
+/// Cmd + scroll wheel (Ctrl on Windows / Linux) or a trackpad pinch over the picture zooms about
+/// the pointer. egui turns both into `zoom_delta`; plain scrolling still pans.
+#[allow(clippy::too_many_arguments)]
+pub fn zoom_input(app: &mut FilmcraftApp, ui: &mut egui::Ui, w: Which, area: Rect, pic: Rect, fw: f32, fh: f32, ppp: f32) {
+    if !ui.rect_contains_pointer(area) {
+        return;
+    }
+    let factor = ui.input(|i| i.zoom_delta());
+    if (factor - 1.0).abs() < 1e-4 {
+        return;
+    }
+    let Some(pointer) = ui.input(|i| i.pointer.hover_pos()) else { return };
+    let zoom = view(app, w).zoom;
+    if let Some((z, pan)) = zoom_about(area, pic, fw, fh, ppp, zoom, pointer, factor) {
+        let v = view_mut(app, w);
+        v.zoom = z;
+        v.pan = pan;
     }
 }
 
@@ -874,6 +926,41 @@ mod tests {
         v.zoom = Some(0.1);
         let r = picture_rect(area, 1920.0, 1080.0, &v, 1.0);
         assert!((r.center().x - 200.0).abs() < 1e-3, "a small picture stays centred");
+    }
+
+    #[test]
+    fn wheel_zoom_keeps_the_pointed_pixel_and_returns_to_fit() {
+        let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 300.0));
+        let v = MonitorView::default();
+        let fit = picture_rect(area, 1920.0, 1080.0, &v, 1.0);
+        // Zoom in 2x about a point left of centre: that frame pixel stays under the pointer.
+        let p = pos2(100.0, 150.0);
+        let (z, pan) = zoom_about(area, fit, 1920.0, 1080.0, 1.0, None, p, 2.0).expect("valid inputs");
+        let z = z.expect("magnified");
+        assert!((z - 2.0 * 400.0 / 1920.0).abs() < 1e-4);
+        let v2 = MonitorView { zoom: Some(z), pan, ..MonitorView::default() };
+        let pic = picture_rect(area, 1920.0, 1080.0, &v2, 1.0);
+        let u_before = (p.x - fit.min.x) / fit.width();
+        let u_after = (p.x - pic.min.x) / pic.width();
+        assert!((u_before - u_after).abs() < 1e-4, "pointed pixel moved: {u_before} -> {u_after}");
+        // Zooming back out past the fitted size returns to Fit with no pan.
+        let back = zoom_about(area, pic, 1920.0, 1080.0, 1.0, Some(z), p, 0.4).expect("valid inputs");
+        assert_eq!(back, (None, [0.0, 0.0]));
+        // Capped at 1600 %.
+        let (zmax, _) = zoom_about(area, pic, 1920.0, 1080.0, 1.0, Some(z), p, 1.0e6).expect("valid inputs");
+        assert_eq!(zmax, Some(16.0));
+    }
+
+    #[test]
+    fn wheel_zoom_rejects_hostile_inputs() {
+        let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 300.0));
+        let pic = area;
+        let p = pos2(10.0, 10.0);
+        assert!(zoom_about(area, pic, 0.0, 1080.0, 1.0, None, p, 2.0).is_none());
+        assert!(zoom_about(area, pic, 1920.0, 1080.0, 1.0, None, p, f32::NAN).is_none());
+        assert!(zoom_about(area, pic, 1920.0, 1080.0, 1.0, None, p, -1.0).is_none());
+        let empty = Rect::from_min_size(pos2(0.0, 0.0), vec2(0.0, 0.0));
+        assert!(zoom_about(empty, pic, 1920.0, 1080.0, 1.0, None, p, 2.0).is_none());
     }
 
     #[test]
