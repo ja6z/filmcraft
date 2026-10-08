@@ -36,6 +36,7 @@ pub mod vfx;
 
 use std::sync::Arc;
 
+use filmcraft_frame::VideoFrame;
 use filmcraft_geom::{Affine, Vec2};
 use filmcraft_media::{FrameRequest, SharedSource};
 use filmcraft_project::{ItemId, ItemKind, ParamValue, Project, Sequence, TrackItem};
@@ -336,15 +337,15 @@ pub(crate) fn item_layer(
             roi::visible_region(lw, lh, &to_output(px), w, h, fx(), &probe(px))
         })
     } else {
-        None
+        Region::Whole(None)
     };
     let (mut layer, px_scale, mut m, cropped) = match region {
-        Some((img, (ox, oy), lw)) => {
+        Region::Part(img, (ox, oy), lw) => {
             let px = lw as f32 / src_w;
             (img, px, to_output(px).then_apply(&Affine::translate(ox as f64, oy as f64)), true)
         }
-        None => {
-            let layer = base_layer(project, seq, item, t, opts, sources, want)?;
+        Region::Whole(decoded) => {
+            let layer = base_layer_from(project, seq, item, t, opts, sources, want, decoded)?;
             let px = layer.w as f32 / src_w;
             (layer, px, to_output(px), false)
         }
@@ -406,6 +407,21 @@ pub(crate) fn base_layer(
     sources: &dyn SourceProvider,
     want: f32,
 ) -> Option<Image> {
+    base_layer_from(project, seq, item, t, opts, sources, want, None)
+}
+
+/// [`base_layer`], reusing the media frame `decoded` when the caller already decoded it.
+#[allow(clippy::too_many_arguments)]
+fn base_layer_from(
+    project: &Project,
+    seq: &Sequence,
+    item: &TrackItem,
+    t: Tick,
+    opts: RenderOptions,
+    sources: &dyn SourceProvider,
+    want: f32,
+    decoded: Option<Arc<VideoFrame>>,
+) -> Option<Image> {
     // `ft`: the media time of the frame shown
     let ft = item.source_time_at(t);
     let mt = item.effect_time_at(t);
@@ -414,7 +430,10 @@ pub(crate) fn base_layer(
     Some(match &pi.kind {
         ItemKind::Media(_) | ItemKind::Subclip { .. } => {
             let src = sources.source(item.item)?;
-            let frame = src.video_frame(FrameRequest { time: ft, scale: want }).ok()?;
+            let frame = match decoded {
+                Some(f) => f,
+                None => src.video_frame(FrameRequest { time: ft, scale: want }).ok()?,
+            };
             let n = decimation(frame.width as f32, src_size.0 as f32 * want);
             let img = colorman::decode(project, item.item, &frame, n, &seq.settings.color);
             let img = match interpolation_blend(item, t, src.info().frame_rate()) {
@@ -456,12 +475,20 @@ pub(crate) fn base_layer(
     })
 }
 
+/// What [`media_region`] made of a clip's picture.
+enum Region {
+    /// The converted part, its origin in the working picture and the working picture's width.
+    Part(Image, (usize, usize), usize),
+    /// The whole picture is needed; the media frame when it was already decoded.
+    Whole(Option<Arc<VideoFrame>>),
+}
+
 /// A media clip's picture converted only where it is needed: when its working picture is the
 /// decoded frame itself (decimated by a power of two, no exact downscale, no frame blending),
 /// `region(lw, lh)` names the part to keep in working pixels and only that part of the frame's
 /// planes is converted to linear light — the same pixels [`base_layer`] would produce there
-/// ([`VideoFrame::cropped`]), for a fraction of the colour conversion. Returns the crop, its
-/// origin in working pixels and the full working width. None = use [`base_layer`].
+/// ([`VideoFrame::cropped`]), for a fraction of the colour conversion. Otherwise the whole
+/// picture goes through [`base_layer`], with the frame if it was decoded here.
 #[allow(clippy::too_many_arguments)]
 fn media_region(
     project: &Project,
@@ -472,28 +499,28 @@ fn media_region(
     want: f32,
     src_w: f32,
     region: impl FnOnce(usize, usize) -> Option<[usize; 4]>,
-) -> Option<(Image, (usize, usize), usize)> {
-    let pi = project.item(item.item)?;
+) -> Region {
+    let Some(pi) = project.item(item.item) else { return Region::Whole(None) };
     if !matches!(pi.kind, ItemKind::Media(_) | ItemKind::Subclip { .. }) {
-        return None;
+        return Region::Whole(None);
     }
-    let src = sources.source(item.item)?;
+    let Some(src) = sources.source(item.item) else { return Region::Whole(None) };
     if interpolation_blend(item, t, src.info().frame_rate()).is_some() {
-        return None;
+        return Region::Whole(None);
     }
-    let frame = src.video_frame(FrameRequest { time: item.source_time_at(t), scale: want }).ok()?;
+    let Ok(frame) = src.video_frame(FrameRequest { time: item.source_time_at(t), scale: want }) else { return Region::Whole(None) };
     let n = decimation(frame.width as f32, src_w * want);
     let (lw, lh) = ((frame.width as usize / n).max(1), (frame.height as usize / n).max(1));
     // `base_layer` would resize this picture exactly: keep its path
     let tw = (src_w * want).ceil();
     if tw >= 1.0 && lw as f32 >= tw * EXACT_DOWNSCALE_MIN {
-        return None;
+        return Region::Whole(Some(frame));
     }
-    let [x0, y0, x1, y1] = region(lw, lh)?;
+    let Some([x0, y0, x1, y1]) = region(lw, lh) else { return Region::Whole(Some(frame)) };
     let px = |v: usize| u32::try_from(v.saturating_mul(n)).unwrap_or(u32::MAX);
-    let (part, fx0, fy0) = frame.cropped(px(x0), px(y0), px(x1), px(y1), n as u32)?;
+    let Some((part, fx0, fy0)) = frame.cropped(px(x0), px(y0), px(x1), px(y1), n as u32) else { return Region::Whole(Some(frame)) };
     let img = colorman::decode(project, item.item, &part, n, &seq.settings.color);
-    Some((img, (fx0 as usize / n, fy0 as usize / n), lw))
+    Region::Part(img, (fx0 as usize / n, fy0 as usize / n), lw)
 }
 
 /// The layer of one clip at timeline `t` with its effects applied, on a canvas the size of the
