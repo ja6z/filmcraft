@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use filmcraft_captions::{Document, Format, WriteOptions};
 use filmcraft_edit as edit;
 use filmcraft_edit::Edge;
-use filmcraft_project::{CaptionAlign, CaptionAnchor, CaptionFormat, CaptionStyle, CaptionTrack, ClipId, SequenceSettings, TrackId};
+use filmcraft_project::{CaptionAlign, CaptionAnchor, CaptionFormat, CaptionHighlight, CaptionStyle, CaptionTrack, ClipId, SequenceSettings, TrackId};
 use filmcraft_time::{Tick, TimeDisplay, format_time};
 
 use crate::commands::{CommandSpec, always, bad, bool_p, f64_p, has_seq, str_p, time_p, u64_p};
@@ -172,6 +172,7 @@ fn caption_json(s: &Session, c: &filmcraft_project::Caption) -> Value {
         "out": tc(c.end()),
         "duration": tc(c.duration),
         "text": c.text,
+        "wordTimes": c.has_word_times(),
         "speaker": c.speaker,
         "settings": c.settings,
     })
@@ -192,6 +193,7 @@ fn track_json(s: &Session, t: &CaptionTrack, index: usize) -> Value {
             "background": t.style.background, "backgroundColor": hex(t.style.background_color),
             "align": format!("{:?}", t.style.align).to_lowercase(), "anchor": format!("{:?}", t.style.anchor).to_lowercase(),
             "margin": t.style.margin, "lineSpacing": t.style.line_spacing, "outline": t.style.outline, "outlineColor": hex(t.style.outline_color),
+            "fontStyle": t.style.font_style, "highlight": t.style.highlight.label().to_lowercase(), "highlightColor": hex(t.style.highlight_color),
         },
         "captions": t.captions.iter().map(|c| caption_json(s, c)).collect::<Vec<_>>(),
     })
@@ -296,7 +298,7 @@ pub fn commands() -> Vec<CommandSpec> {
             "Caption Track Style",
             &[],
             None,
-            r##"{"track":id|"C1","font":str?,"size":f32?,"color":"#rrggbb[aa]"?,"background":bool?,"backgroundColor":"#rrggbbaa"?,"align":"left|center|right"?,"anchor":"top|middle|bottom"?,"margin":0..0.45 (fraction of frame height)?,"lineSpacing":f32?,"outline":f32?,"outlineColor":str?,"reset":bool?}"##,
+            r##"{"track":id|"C1","font":str?,"fontStyle":str?,"highlight":"none|color|box"?,"highlightColor":"#rrggbb[aa]"?,"size":f32?,"color":"#rrggbb[aa]"?,"background":bool?,"backgroundColor":"#rrggbbaa"?,"align":"left|center|right"?,"anchor":"top|middle|bottom"?,"margin":0..0.45 (fraction of frame height)?,"lineSpacing":f32?,"outline":f32?,"outlineColor":str?,"reset":bool?}"##,
             has_caption_track,
             |s, p| {
                 let tid = track_param(s, p).ok_or_else(|| bad("captions.setStyle", "no such caption track"))?;
@@ -308,8 +310,18 @@ pub fn commands() -> Vec<CommandSpec> {
                     if bool_p(&p, "reset").unwrap_or(false) {
                         *y = CaptionStyle::default();
                     }
-                    if let Some(v) = str_p(&p, "font") {
+                    if let Some(v) = str_p(&p, "font").map(str::trim).filter(|v| !v.is_empty()) {
                         y.font = v.to_string();
+                    }
+                    if let Some(v) = str_p(&p, "fontStyle").map(str::trim).filter(|v| !v.is_empty()) {
+                        y.font_style = v.to_string();
+                    }
+                    if let Some(v) = str_p(&p, "highlight") {
+                        y.highlight =
+                            CaptionHighlight::from_name(v).ok_or_else(|| bad("captions.setStyle", format!("unknown highlight `{v}` (none, color, box)")))?;
+                    }
+                    if let Some(c) = p.get("highlightColor").and_then(parse_color) {
+                        y.highlight_color = c;
                     }
                     if let Some(v) = f64_p(&p, "size") {
                         y.size = (v as f32).clamp(4.0, 400.0);

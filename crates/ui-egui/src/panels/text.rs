@@ -6,7 +6,7 @@
 //! the selection marks In/Out and can be extracted or lifted (`transcript.*` commands).
 
 use egui::{Align2, Color32, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
-use filmcraft_project::{CaptionAlign, CaptionAnchor, CaptionFormat};
+use filmcraft_project::{CaptionAlign, CaptionAnchor, CaptionFormat, CaptionHighlight};
 use filmcraft_time::{TimeDisplay, format_time};
 use serde_json::{Value, json};
 
@@ -151,8 +151,8 @@ fn captions(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         x += 28.0;
     }
 
-    // ---- style strip
-    let style_h = 30.0;
+    // ---- style strip (two rows: box and placement, then font and highlight)
+    let style_h = 58.0;
     let style_rect = Rect::from_min_max(pos2(rect.min.x + 10.0, rect.max.y - style_h), pos2(rect.max.x - 10.0, rect.max.y - 2.0));
     style_strip(app, ui, style_rect, track_idx, &mut actions);
 
@@ -376,7 +376,7 @@ fn style_strip(app: &mut FilmcraftApp, ui: &mut egui::Ui, r: Rect, track_idx: us
     let Some(tr) = app.session.active_sequence().and_then(|q| q.caption_tracks.get(track_idx)).cloned() else { return };
     let st = tr.style.clone();
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(r).id_salt("caption-style"));
-    child.horizontal_centered(|ui| {
+    child.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
         let mut size = st.size;
         let resp = ui.add(egui::DragValue::new(&mut size).range(8.0..=200.0).speed(0.5).suffix(" px"));
@@ -411,6 +411,57 @@ fn style_strip(app: &mut FilmcraftApp, ui: &mut egui::Ui, r: Rect, track_idx: us
             app.auto.add(&format!("text.captions.style.anchor.{name}"), resp.rect, name);
             if resp.clicked() {
                 actions.push(("captions.setStyle".into(), json!({"track": tr.id.0, "anchor": name})));
+            }
+        }
+    });
+    child.add_space(4.0);
+    child.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        // font family and style: the bundled Inter or any installed font
+        let fams = filmcraft_text::families();
+        let r = egui::ComboBox::from_id_salt(("caption-font", tr.id.0)).selected_text(&st.font).width(130.0).height(400.0).show_ui(ui, |ui| {
+            if !filmcraft_text::fonts::system_scanned() {
+                filmcraft_text::fonts::scan_system();
+            }
+            for (f, _) in &fams {
+                if ui.selectable_label(f.eq_ignore_ascii_case(&st.font), f).clicked() {
+                    actions.push(("captions.setStyle".into(), json!({"track": tr.id.0, "font": f})));
+                }
+            }
+        });
+        app.auto.add("text.captions.style.font", r.response.rect, "Caption font");
+        let styles: Vec<String> = fams.iter().find(|(f, _)| f.eq_ignore_ascii_case(&st.font)).map(|(_, s)| s.clone()).unwrap_or_default();
+        let r = egui::ComboBox::from_id_salt(("caption-font-style", tr.id.0)).selected_text(&st.font_style).width(96.0).show_ui(ui, |ui| {
+            let mut seen: Vec<&str> = Vec::new();
+            for s in styles.iter().map(String::as_str).chain(["Bold", "Black", "Italic"]) {
+                if seen.contains(&s) {
+                    continue;
+                }
+                seen.push(s);
+                if ui.selectable_label(s.eq_ignore_ascii_case(&st.font_style), s).clicked() {
+                    actions.push(("captions.setStyle".into(), json!({"track": tr.id.0, "fontStyle": s})));
+                }
+            }
+        });
+        app.auto.add("text.captions.style.fontStyle", r.response.rect, "Caption font style");
+        // word-by-word highlight (captions made from a transcript)
+        ui.label(egui::RichText::new("Highlight").size(11.0).color(app.tokens.text_dim))
+            .on_hover_text("Light the word being spoken (captions made from a transcript)");
+        for h in CaptionHighlight::ALL {
+            let name = h.label().to_ascii_lowercase();
+            let resp = ui.selectable_label(st.highlight == h, h.label());
+            app.auto.add(&format!("text.captions.style.highlight.{name}"), resp.rect, h.label());
+            if resp.clicked() {
+                actions.push(("captions.setStyle".into(), json!({"track": tr.id.0, "highlight": name})));
+            }
+        }
+        if st.highlight != CaptionHighlight::None {
+            let c = st.highlight_color;
+            let mut col = Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]);
+            let resp = egui::color_picker::color_edit_button_srgba(ui, &mut col, egui::color_picker::Alpha::Opaque);
+            app.auto.add("text.captions.style.highlightColor", resp.rect, "Highlight colour");
+            if resp.changed() {
+                actions.push(("captions.setStyle".into(), json!({"track": tr.id.0, "highlightColor": col.to_srgba_unmultiplied()})));
             }
         }
     });

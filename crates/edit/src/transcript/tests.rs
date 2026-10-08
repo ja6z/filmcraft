@@ -295,3 +295,20 @@ fn captions_never_overlap_with_dense_words() {
     let b = caption_blocks(&words, &rules, R);
     check_blocks(&b, &rules);
 }
+
+#[test]
+fn captions_from_words_carry_word_times() {
+    let w = sequence_words(&whole(), &transcripts());
+    let b = caption_blocks(&w, &CaptionRules::default(), R);
+    let mut n = 1;
+    let none = |_: ItemId| None;
+    let mut ctx = crate::EditCtx { next_id: &mut n, media_duration: &none, media_start: &|_| Tick::ZERO, min_duration: Tick(10) };
+    let caps = blocks_to_captions(&b, &mut ctx);
+    for (blk, c) in b.iter().zip(&caps) {
+        assert!(c.has_word_times(), "{:?}", c.text);
+        assert_eq!(c.words.len(), blk.word_times.len());
+        // relative to the caption's start, and in order
+        assert_eq!(c.words[0].start, blk.word_times[0].0 - c.start);
+        assert!(c.words.windows(2).all(|p| p[0].start <= p[1].start));
+    }
+}

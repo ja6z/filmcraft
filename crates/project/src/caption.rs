@@ -7,6 +7,10 @@
 //!
 //! Caption text is kept as written (lines separated by `\n`, inline `<i>`/`<b>`/`<u>` tags and
 //! WebVTT cue settings preserved) so files round-trip; renderers strip markup for display.
+//!
+//! Captions made from a transcript also carry **word times** ([`CaptionWord`], one per word of the
+//! text, relative to the caption's start so moves and ripples keep them in place), which drive the
+//! track style's word-by-word highlight ([`CaptionHighlight`]).
 
 use filmcraft_time::{Tick, TimeRange};
 use serde::{Deserialize, Serialize};
@@ -70,12 +74,40 @@ pub enum CaptionAnchor {
     Bottom,
 }
 
+/// Word-by-word highlight of captions that carry word times (CapCut-style karaoke).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CaptionHighlight {
+    #[default]
+    None,
+    /// The word being spoken takes the highlight colour.
+    Color,
+    /// A box in the highlight colour sits behind the word being spoken.
+    Box,
+}
+
+impl CaptionHighlight {
+    pub const ALL: [CaptionHighlight; 3] = [CaptionHighlight::None, CaptionHighlight::Color, CaptionHighlight::Box];
+    pub fn label(self) -> &'static str {
+        match self {
+            CaptionHighlight::None => "None",
+            CaptionHighlight::Color => "Color",
+            CaptionHighlight::Box => "Box",
+        }
+    }
+    pub fn from_name(s: &str) -> Option<CaptionHighlight> {
+        Self::ALL.iter().copied().find(|h| h.label().eq_ignore_ascii_case(s.trim()))
+    }
+}
+
 /// Track-level caption style (Premiere's caption track style / Essential Graphics text settings).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CaptionStyle {
-    /// Font family name. Only the bundled Inter is rendered today; other names fall back to it.
+    /// Font family: the bundled Inter or any installed family (unknown names fall back to Inter).
     pub font: String,
+    /// Style of `font` ("SemiBold", "Black", "Bold Italic"…); a weight the family lacks is
+    /// synthesised from the nearest one.
+    pub font_style: String,
     /// Font size in pixels for a 1080-line frame (scaled with the frame height).
     pub size: f32,
     /// Text colour, sRGB + alpha.
@@ -93,12 +125,16 @@ pub struct CaptionStyle {
     /// Text outline width in pixels at 1080 lines (0 = none).
     pub outline: f32,
     pub outline_color: [u8; 4],
+    /// Word-by-word highlight (captions with word times only).
+    pub highlight: CaptionHighlight,
+    pub highlight_color: [u8; 4],
 }
 
 impl Default for CaptionStyle {
     fn default() -> Self {
         Self {
             font: "Inter".into(),
+            font_style: "SemiBold".into(),
             size: 54.0,
             color: [255, 255, 255, 255],
             background: true,
@@ -109,8 +145,17 @@ impl Default for CaptionStyle {
             line_spacing: 1.25,
             outline: 0.0,
             outline_color: [0, 0, 0, 255],
+            highlight: CaptionHighlight::None,
+            highlight_color: [255, 214, 10, 255],
         }
     }
+}
+
+/// When one word of a caption is spoken, relative to the caption's start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CaptionWord {
+    pub start: Tick,
+    pub end: Tick,
 }
 
 /// One caption block on a caption track.
@@ -131,6 +176,10 @@ pub struct Caption {
     /// WebVTT cue settings (`line:90% align:start`…), kept verbatim.
     #[serde(default)]
     pub settings: String,
+    /// Word times, one per word of the plain text (captions made from a transcript); empty when
+    /// unknown. Relative to `start`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub words: Vec<CaptionWord>,
 }
 
 impl Caption {
@@ -143,6 +192,39 @@ impl Caption {
     /// The caption's text with markup removed and entities decoded (what is drawn).
     pub fn plain_lines(&self) -> Vec<String> {
         plain_text(&self.text).lines().map(str::to_string).collect()
+    }
+    /// The words of the plain text (what [`Caption::words`] times, in order).
+    pub fn tokens(&self) -> Vec<String> {
+        plain_text(&self.text).split_whitespace().map(str::to_string).collect()
+    }
+    /// Whether the word times still describe the text (one per word).
+    pub fn has_word_times(&self) -> bool {
+        !self.words.is_empty() && self.words.len() == plain_text(&self.text).split_whitespace().count()
+    }
+    /// The word being spoken `rel` after the caption's start: the last word that has started (it
+    /// stays lit through the pause after it). None before the first word or without word times.
+    pub fn word_at(&self, rel: Tick) -> Option<usize> {
+        if !self.has_word_times() {
+            return None;
+        }
+        let n = self.words.partition_point(|w| w.start <= rel);
+        n.checked_sub(1)
+    }
+    /// Keep the words where they are on the timeline after `start` moved from `old_start`.
+    pub fn rebase_words(&mut self, old_start: Tick) {
+        let d = old_start - self.start;
+        for w in &mut self.words {
+            w.start += d;
+            w.end += d;
+        }
+    }
+    /// Map the words' timeline times through `f` (which also saw the caption move from
+    /// `old_start` to `start`), keeping them relative to the new start.
+    pub fn map_words(&mut self, old_start: Tick, f: impl Fn(Tick) -> Tick) {
+        for w in &mut self.words {
+            w.start = f(old_start + w.start) - self.start;
+            w.end = f(old_start + w.end) - self.start;
+        }
     }
 }
 
@@ -302,6 +384,7 @@ mod tests {
                 speaker: None,
                 cue_id: None,
                 settings: String::new(),
+                words: Vec::new(),
             });
         }
         assert_eq!(t.caption_at(Tick(120)).unwrap().text, "c1");
@@ -309,5 +392,33 @@ mod tests {
         assert!(t.check().is_ok());
         assert_eq!(CaptionFormat::from_name("cea608"), Some(CaptionFormat::Cea608));
         assert_eq!(CaptionFormat::from_name("CEA-708"), Some(CaptionFormat::Cea708));
+    }
+
+    #[test]
+    fn word_times_follow_the_text_and_the_caption() {
+        let w = |a: i64, b: i64| CaptionWord { start: Tick(a), end: Tick(b) };
+        let mut c = Caption {
+            id: ClipId(1),
+            start: Tick(100),
+            duration: Tick(100),
+            text: "Ella me\n<i>traicionó</i>".into(),
+            speaker: None,
+            cue_id: None,
+            settings: String::new(),
+            words: vec![w(10, 20), w(25, 30), w(40, 80)],
+        };
+        assert!(c.has_word_times(), "one time per word of the plain text");
+        assert_eq!((c.word_at(Tick(5)), c.word_at(Tick(10)), c.word_at(Tick(33)), c.word_at(Tick(95))), (None, Some(0), Some(1), Some(2)));
+        // the caption moves its start; the words stay put on the timeline
+        c.start = Tick(120);
+        c.rebase_words(Tick(100));
+        assert_eq!(c.words[0], w(-10, 0));
+        c.map_words(Tick(120), |x| x + Tick(5));
+        assert_eq!(c.words[2], w(25, 65));
+        // a different number of words: the times no longer apply
+        c.text = "Ella me traicionó otra vez".into();
+        assert!(!c.has_word_times());
+        assert_eq!(c.word_at(Tick(30)), None);
+        assert_eq!(CaptionHighlight::from_name("BOX"), Some(CaptionHighlight::Box));
     }
 }

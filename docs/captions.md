@@ -9,12 +9,19 @@ version 2; version 1 projects open with no caption tracks).
 - **Caption track** (`CaptionTrack`, `crates/project/src/caption.rs`): name, format (`Subtitle`,
   `CEA-608`, `CEA-708`, `Teletext`), language, output eye (shown in the Program monitor and
   burned in on export), lock, sync lock, and a **track style**:
-  font size (pixels at 1080 lines, scaled to the frame), text colour, background box and its colour,
+  font family and style (the bundled Inter or any installed font, e.g. Montserrat Black; a weight
+  the family lacks is synthesised), font size (pixels at 1080 lines, scaled to the frame), text
+  colour, background box and its colour,
   outline width and colour, alignment (left/centre/right), position (top/middle/bottom) and
   margin (a fraction of the frame height, default 0.08; `captions.setStyle` clamps it to 0–0.45),
-  line spacing.
+  line spacing, and the **word-by-word highlight**: `none`, `color` (the word being spoken takes the
+  highlight colour) or `box` (a rounded box in that colour sits behind it).
 - **Caption**: in/out in exact `Tick`s, text (lines separated by `\n`; `<i>`, `<b>`, `<u>` kept
-  as written), optional speaker, and the WebVTT cue id and cue settings, kept for round trips.
+  as written), optional speaker, the WebVTT cue id and cue settings (kept for round trips), and
+  **word times** for captions made from a transcript (one per word of the text, relative to the
+  caption's start). Split gives each half its own words and times; merge joins them; trims keep
+  each word where it is on the timeline; editing the text keeps the times while the word count
+  stays the same. Files don't carry word times.
   Captions on a track never overlap.
 
 ## Files
@@ -49,7 +56,7 @@ Details of each format and the SCC encoder are in [`crates/captions/README.md`](
 | `captions.delete` | Edit ▸ Clear / Ripple Delete with captions selected | `captions`, `ripple` |
 | `captions.select`, `captions.goTo` | click / number button | `captions`, `add` / `caption` |
 | `captions.setTrack` | caption track header (eye, lock) | `track`, `name`, `format`, `language`, `enabled`, `locked`, `syncLock` |
-| `captions.setStyle` | Text panel style strip | `track`, `size`, `color`, `background`, `backgroundColor`, `outline`, `outlineColor`, `align`, `anchor`, `margin`, `lineSpacing`, `reset` |
+| `captions.setStyle` | Text panel style strip | `track`, `font`, `fontStyle`, `size`, `color`, `background`, `backgroundColor`, `outline`, `outlineColor`, `align`, `anchor`, `margin`, `lineSpacing`, `highlight` (`none`/`color`/`box`), `highlightColor`, `reset` |
 | `captions.deleteTrack` | | `track` |
 | `captions.import` / `captions.export` | File ▸ Export ▸ Captions… | `path`, `format`, `track`, `dropFrame` |
 | `captions.list` | (query) | `track` — tracks, styles and captions with timecodes |
@@ -67,7 +74,7 @@ also splits captions.
   `timeline.captionTrack.C1[.locked|.enabled]`.
 - **Text panel ▸ Captions**: search, track picker (also creates tracks of each format), add /
   split / merge / delete / export buttons, the list of segments with editable in/out timecodes
-  and text (committed when the field loses focus), and the track style strip (size, colour, box,
+  and text (committed when the field loses focus), and the track style strip (size, colour, box, font and style, highlight mode and colour,
   alignment, position). Automation ids: `text.tab.Captions`, `text.captions.add|split|merge|delete|export|search|track`,
   `text.captions.<id>.in|out|text|goto|row`, `text.captions.style.*`.
 

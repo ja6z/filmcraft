@@ -124,6 +124,7 @@ fn remove_fillers_pauses_and_create_captions() {
     let q = s.active_sequence().unwrap();
     let tr = &q.caption_tracks[0];
     assert_eq!(tr.captions[0].text, "Hello world.");
+    assert!(tr.captions.iter().all(|c| c.has_word_times()), "captions from a transcript carry word times");
     assert_eq!(tr.captions[1].speaker.as_deref(), Some("Speaker 2"));
     q.check().unwrap();
 }

@@ -132,6 +132,12 @@ fn caption_commands_need_tracks_and_navigate() {
     let st = &s.active_sequence().unwrap().caption_tracks[0].style;
     assert_eq!(st.color, [255, 255, 0, 255]);
     assert!(s.execute("captions.setStyle", json!({"anchor": "sideways"})).is_err());
+    // font, its style and the word-by-word highlight
+    s.execute("captions.setStyle", json!({"font": "JetBrains Mono", "fontStyle": "Bold", "highlight": "box", "highlightColor": "#22c55e"})).unwrap();
+    let st = &s.active_sequence().unwrap().caption_tracks[0].style;
+    assert_eq!((st.font.as_str(), st.font_style.as_str(), st.highlight), ("JetBrains Mono", "Bold", filmcraft_project::CaptionHighlight::Box));
+    assert_eq!(st.highlight_color, [0x22, 0xc5, 0x5e, 255]);
+    assert!(s.execute("captions.setStyle", json!({"highlight": "sparkle"})).is_err());
     s.execute("captions.setTimes", json!({"caption": id.0, "startSeconds": 0.5, "endSeconds": 2.5})).unwrap();
     assert!(s.execute("captions.setTimes", json!({"caption": id.0, "endSeconds": 3.5})).is_err(), "would overlap `two`");
     s.execute("captions.deleteTrack", json!({"track": "C1"})).unwrap();

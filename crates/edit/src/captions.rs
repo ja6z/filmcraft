@@ -5,7 +5,7 @@
 //! whole edit. Locked caption tracks refuse edits. Sync-locked caption tracks follow insert and
 //! extract edits on the media tracks (see [`crate::insert`] / [`crate::extract`]).
 
-use filmcraft_project::{Caption, CaptionTrack, ClipId, Sequence, TrackId};
+use filmcraft_project::{Caption, CaptionTrack, CaptionWord, ClipId, Sequence, TrackId};
 use filmcraft_time::{Tick, TimeRange};
 
 use crate::{Edge, EditCtx, EditError, Result};
@@ -47,7 +47,7 @@ pub fn add_caption(seq: &mut Sequence, track: TrackId, start: Tick, duration: Ti
         return Err(EditError::TooShort);
     }
     let id = ClipId(ctx.alloc());
-    t.captions.push(Caption { id, start, duration: dur, text: text.to_string(), speaker: None, cue_id: None, settings: String::new() });
+    t.captions.push(Caption { id, start, duration: dur, text: text.to_string(), speaker: None, cue_id: None, settings: String::new(), words: Vec::new() });
     t.sort();
     Ok(id)
 }
@@ -69,9 +69,50 @@ pub fn split_caption(seq: &mut Sequence, id: ClipId, t: Tick, ctx: &mut EditCtx)
     right.duration = c.end() - t;
     right.cue_id = None;
     c.duration = t - c.start;
+    split_words(c, &mut right);
     tr.captions.push(right);
     tr.sort();
     Ok(new_id)
+}
+
+/// After a split at `right.start`: a caption with word times gives each half the words spoken in
+/// it (text and times); otherwise (or when every word falls on one side) both halves keep the
+/// text and lose the word times.
+fn split_words(left: &mut Caption, right: &mut Caption) {
+    let n = left.words.len();
+    let cut = right.start - left.start;
+    let k = left.words.partition_point(|w| w.start < cut);
+    if !left.has_word_times() || k == 0 || k == n {
+        left.words.clear();
+        right.words.clear();
+        return;
+    }
+    let text = left.text.clone();
+    left.text = keep_tokens(&text, 0..k);
+    right.text = keep_tokens(&text, k..n);
+    left.words.truncate(k);
+    right.words.drain(..k);
+    right.rebase_words(right.start - cut);
+}
+
+/// The plain text's words with index in `keep`, keeping the line breaks between them.
+fn keep_tokens(text: &str, keep: std::ops::Range<usize>) -> String {
+    let mut i = 0;
+    let mut lines = Vec::new();
+    for line in filmcraft_project::plain_text(text).lines() {
+        let words: Vec<&str> = line
+            .split_whitespace()
+            .filter(|_| {
+                let k = keep.contains(&i);
+                i += 1;
+                k
+            })
+            .collect();
+        if !words.is_empty() {
+            lines.push(words.join(" "));
+        }
+    }
+    lines.join("\n")
 }
 
 /// Split every caption strictly containing `t` on unlocked caption tracks (all when `tracks` is
@@ -110,10 +151,24 @@ pub fn merge_captions(seq: &mut Sequence, ids: &[ClipId]) -> Result<ClipId> {
     };
     let end = tr.captions[last].end();
     let text: Vec<String> = idx.iter().map(|&i| tr.captions[i].text.trim().to_string()).filter(|t| !t.is_empty()).collect();
+    // word times survive when every merged caption has them
+    let first_start = tr.captions[first].start;
+    let words: Vec<CaptionWord> = if idx.iter().all(|&i| tr.captions[i].has_word_times()) {
+        idx.iter()
+            .flat_map(|&i| {
+                let c = &tr.captions[i];
+                let d = c.start - first_start;
+                c.words.iter().map(move |w| CaptionWord { start: w.start + d, end: w.end + d })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let keep = tr.captions[first].id;
     let c = &mut tr.captions[first];
     c.duration = end - c.start;
     c.text = text.join("\n");
+    c.words = words;
     tr.captions.drain(first + 1..=last);
     Ok(keep)
 }
@@ -124,6 +179,10 @@ pub fn set_caption(seq: &mut Sequence, id: ClipId, text: Option<&str>, speaker: 
     let c = track_mut(seq, tid)?.caption_mut(id).ok_or(EditError::NoItem(id))?;
     if let Some(t) = text {
         c.text = t.replace("\r\n", "\n");
+        // fixing a word keeps the word times; adding or removing words drops them
+        if !c.has_word_times() {
+            c.words.clear();
+        }
     }
     if let Some(s) = speaker {
         c.speaker = s.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
@@ -142,8 +201,10 @@ pub fn set_caption_times(seq: &mut Sequence, id: ClipId, start: Tick, end: Tick,
         return Err(EditError::Other("captions would overlap".into()));
     }
     let c = tr.caption_mut(id).ok_or(EditError::NoItem(id))?;
+    let old = c.start;
     c.start = start;
     c.duration = end - start;
+    c.rebase_words(old);
     tr.sort();
     Ok(())
 }
@@ -166,6 +227,7 @@ pub fn trim_caption(seq: &mut Sequence, id: ClipId, edge: Edge, delta: Tick, ctx
         Edge::In => {
             c.start += d;
             c.duration -= d;
+            c.rebase_words(c.start - d);
         }
         Edge::Out => c.duration += d,
     }
@@ -258,6 +320,7 @@ pub fn insert_gap(tr: &mut CaptionTrack, at: Tick, dur: Tick, ctx: &mut EditCtx)
         right.cue_id = None;
         if let Some(l) = tr.caption_mut(c.id) {
             l.duration = at - c.start;
+            split_words(l, &mut right);
         }
         tr.captions.push(right);
         tr.sort();
@@ -284,6 +347,16 @@ pub fn extract_range(tr: &mut CaptionTrack, range: TimeRange) {
             if left + right > Tick::ZERO {
                 c.start = s.min(a);
                 c.duration = left + right;
+                // words in the removed range collapse onto the cut, later ones close up
+                c.map_words(s, |x| {
+                    if x < a {
+                        x
+                    } else if x < b {
+                        a
+                    } else {
+                        x - range.duration
+                    }
+                });
                 out.push(c);
             }
         }
@@ -312,6 +385,7 @@ mod tests {
                 speaker: None,
                 cue_id: None,
                 settings: String::new(),
+                words: Vec::new(),
             });
         }
         seq.caption_tracks.push(tr);
@@ -336,6 +410,51 @@ mod tests {
         assert!(add_caption(&mut seq, tid, Tick(120), Tick(10), "x", &mut ctx(&mut n)).is_err());
         assert!(add_caption(&mut seq, tid, Tick(95), Tick(10), "x", &mut ctx(&mut n)).is_err(), "would be shorter than min");
         assert!(seq.check().is_ok());
+    }
+
+    #[test]
+    fn word_times_survive_split_merge_text_and_trims() {
+        let w = |a: i64, b: i64| CaptionWord { start: Tick(a), end: Tick(b) };
+        let (mut seq, tid) = seq_with(&[(0, 100, "uno dos\ntres cuatro")]);
+        let c = seq.caption_tracks[0].caption_mut(ClipId(1000)).unwrap();
+        c.words = vec![w(0, 20), w(20, 45), w(50, 70), w(70, 95)];
+        let mut n = 1;
+        // the split gives each half its words, text and times (relative to its own start)
+        let r = split_caption(&mut seq, ClipId(1000), Tick(48), &mut ctx(&mut n)).unwrap();
+        assert_eq!(spans(&seq, tid), vec![(0, 48, "uno dos".into()), (48, 100, "tres cuatro".into())]);
+        let right = seq.find_caption(r).unwrap().1.clone();
+        assert_eq!(right.words, vec![w(2, 22), w(22, 47)]);
+        // merging puts them back together
+        let m = merge_captions(&mut seq, &[ClipId(1000), r]).unwrap();
+        let merged = seq.find_caption(m).unwrap().1.clone();
+        assert_eq!(merged.text, "uno dos\ntres cuatro");
+        assert_eq!(merged.words, vec![w(0, 20), w(20, 45), w(50, 70), w(70, 95)]);
+        // fixing a word keeps the times, changing the word count drops them
+        set_caption(&mut seq, m, Some("uno dos\ntres cinco"), None).unwrap();
+        assert_eq!(seq.find_caption(m).unwrap().1.words.len(), 4);
+        // trimming the in point keeps each word where it was on the timeline
+        trim_caption(&mut seq, m, Edge::In, Tick(10), &ctx(&mut n)).unwrap();
+        assert_eq!(seq.find_caption(m).unwrap().1.words[1], w(10, 35));
+        set_caption(&mut seq, m, Some("uno dos tres"), None).unwrap();
+        assert!(seq.find_caption(m).unwrap().1.words.is_empty());
+        // a split with every word on one side keeps the old behaviour (both keep the text)
+        let (mut seq, tid) = seq_with(&[(0, 100, "solo")]);
+        seq.caption_tracks[0].caption_mut(ClipId(1000)).unwrap().words = vec![w(0, 30)];
+        split_caption(&mut seq, ClipId(1000), Tick(60), &mut ctx(&mut n)).unwrap();
+        assert_eq!(spans(&seq, tid), vec![(0, 60, "solo".into()), (60, 100, "solo".into())]);
+        assert!(seq.caption_tracks[0].captions.iter().all(|c| c.words.is_empty()));
+    }
+
+    #[test]
+    fn extract_closes_word_times_up() {
+        let w = |a: i64, b: i64| CaptionWord { start: Tick(a), end: Tick(b) };
+        let (mut seq, _) = seq_with(&[(0, 100, "a b c")]);
+        let tr = &mut seq.caption_tracks[0];
+        tr.captions[0].words = vec![w(0, 10), w(40, 50), w(80, 90)];
+        extract_range(tr, TimeRange::new(Tick(30), Tick(30)));
+        let c = &tr.captions[0];
+        assert_eq!(c.duration, Tick(70));
+        assert_eq!(c.words, vec![w(0, 10), w(30, 30), w(50, 60)], "the cut word collapses onto the cut, later ones close up");
     }
 
     #[test]

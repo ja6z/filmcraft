@@ -1,13 +1,16 @@
 //! Caption layout and burn-in.
 //!
 //! [`overlay`] lays out the caption showing on a track at a time with the track's
-//! [`CaptionStyle`] (size relative to a 1080-line frame, colour, background box, outline,
-//! alignment, anchor and margin; WebVTT `line:N%` and `align:` cue settings override the style)
-//! and rasterises it into a small premultiplied linear-light RGBA [`Overlay`] positioned in the
-//! frame. Renderers composite overlays over the finished picture.
+//! [`CaptionStyle`] (font family and style, size relative to a 1080-line frame, colour,
+//! background box, outline, alignment, anchor and margin; WebVTT `line:N%` and `align:` cue
+//! settings override the style) and rasterises it into a small premultiplied linear-light RGBA
+//! [`Overlay`] positioned in the frame. Renderers composite overlays over the finished picture.
+//!
+//! Captions with word times light the word being spoken when the style asks for it
+//! ([`CaptionHighlight`]: the word in the highlight colour, or a box in that colour behind it).
 
 use filmcraft_color::srgb_to_linear;
-use filmcraft_project::{Caption, CaptionAlign, CaptionAnchor, CaptionStyle, CaptionTrack, Sequence};
+use filmcraft_project::{Caption, CaptionAlign, CaptionAnchor, CaptionHighlight, CaptionStyle, CaptionTrack, Sequence};
 use filmcraft_time::Tick;
 
 use filmcraft_text::{ParagraphStyle, TextStyle, layout, render};
@@ -49,13 +52,23 @@ impl Overlay {
     }
 }
 
-/// The caption face: Inter SemiBold at `px`.
-fn caption_style(px: f32) -> TextStyle {
-    TextStyle { style: "SemiBold".into(), size: px, ..Default::default() }
+/// The track's face at `px`.
+fn caption_style(style: &CaptionStyle, px: f32) -> TextStyle {
+    TextStyle { family: style.font.clone(), style: style.font_style.clone(), size: px, ..Default::default() }
 }
 
-fn measure(text: &str, px: f32) -> f32 {
-    filmcraft_text::measure(text, &caption_style(px))
+fn measure(text: &str, ts: &TextStyle) -> f32 {
+    filmcraft_text::measure(text, ts)
+}
+
+/// Coverage of a rounded rectangle at pixel `(x, y)` (centre sampling with a one-pixel ramp).
+fn rounded_rect_cover(x: f32, y: f32, r: [f32; 4], radius: f32) -> f32 {
+    let (cx, cy) = ((r[0] + r[2]) / 2.0, (r[1] + r[3]) / 2.0);
+    let (hx, hy) = ((r[2] - r[0]) / 2.0 - radius, (r[3] - r[1]) / 2.0 - radius);
+    let dx = ((x - cx).abs() - hx).max(0.0);
+    let dy = ((y - cy).abs() - hy).max(0.0);
+    let d = (dx * dx + dy * dy).sqrt() - radius;
+    (0.5 - d).clamp(0.0, 1.0)
 }
 
 fn lin(c: [u8; 4]) -> [f32; 4] {
@@ -64,12 +77,12 @@ fn lin(c: [u8; 4]) -> [f32; 4] {
 }
 
 /// Word-wrap one line to `max_w` pixels.
-fn wrap(line: &str, px: f32, max_w: f32) -> Vec<String> {
+fn wrap(line: &str, ts: &TextStyle, max_w: f32) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     for word in line.split(' ') {
         let cand = if cur.is_empty() { word.to_string() } else { format!("{cur} {word}") };
-        if !cur.is_empty() && measure(&cand, px) > max_w {
+        if !cur.is_empty() && measure(&cand, ts) > max_w {
             out.push(std::mem::take(&mut cur));
             cur = word.to_string();
         } else {
@@ -109,22 +122,34 @@ fn vtt_overrides(settings: &str) -> (Option<f32>, Option<CaptionAlign>) {
 
 /// Lay out and rasterise one caption for a `w`×`h` frame.
 pub fn render_caption(c: &Caption, style: &CaptionStyle, w: usize, h: usize) -> Option<Overlay> {
+    render_caption_at(c, style, None, w, h)
+}
+
+/// [`render_caption`] `at` a time after the caption's start, lighting the word being spoken
+/// when the style has a highlight and the caption has word times.
+pub fn render_caption_at(c: &Caption, style: &CaptionStyle, at: Option<Tick>, w: usize, h: usize) -> Option<Overlay> {
     if w == 0 || h == 0 {
         return None;
     }
     let scale = h as f32 / 1080.0;
     let px = (style.size * scale).max(4.0);
+    let ts = caption_style(style, px);
     let max_w = w as f32 * 0.9;
     let mut lines: Vec<String> = Vec::new();
     // (speaker names are metadata; like Premiere, they are not burned in)
     for l in c.plain_lines() {
-        lines.extend(wrap(l.trim(), px, max_w));
+        // words one space apart, so the n-th word drawn is the n-th word timed
+        let l = l.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !l.is_empty() {
+            lines.extend(wrap(&l, &ts, max_w));
+        }
     }
     lines.retain(|l| !l.is_empty());
     if lines.is_empty() {
         return None;
     }
-    let vm = filmcraft_text::fonts::face(filmcraft_text::resolve("Inter", "SemiBold").face).metrics(px);
+    let active = at.filter(|_| style.highlight != CaptionHighlight::None).and_then(|t| c.word_at(t));
+    let vm = filmcraft_text::fonts::face(filmcraft_text::resolve(&style.font, &style.font_style).face).metrics(px);
     let (asc, desc) = (vm.ascent, vm.descent);
     let lh = px * style.line_spacing.max(0.8);
     let pad_x = (px * 0.3).round();
@@ -141,7 +166,7 @@ pub fn render_caption(c: &Caption, style: &CaptionStyle, w: usize, h: usize) -> 
     .max(0.0)
     .round();
     let side = w as f32 * 0.05;
-    let widths: Vec<f32> = lines.iter().map(|l| measure(l, px)).collect();
+    let widths: Vec<f32> = lines.iter().map(|l| measure(l, &ts)).collect();
     let xs: Vec<f32> = widths
         .iter()
         .map(|&lw| match align {
@@ -161,6 +186,9 @@ pub fn render_caption(c: &Caption, style: &CaptionStyle, w: usize, h: usize) -> 
     let oh = (by1 - by0).max(1.0) as usize;
     let mut cover = vec![0.0f32; ow * oh];
     let mut bg = vec![0.0f32; ow * oh];
+    // the lit word: its glyphs (Color) or its box (Box)
+    let mut lit = vec![0.0f32; if active.is_some() { ow * oh } else { 0 }];
+    let mut first_word = 0;
     for (i, line) in lines.iter().enumerate() {
         let lt = top + lh * i as f32;
         if style.background && style.background_color[3] > 0 {
@@ -176,13 +204,40 @@ pub fn render_caption(c: &Caption, style: &CaptionStyle, w: usize, h: usize) -> 
             }
         }
         let baseline = lt + (lh - (asc + desc)) / 2.0 + asc;
-        let l = layout(line, &caption_style(px), &ParagraphStyle::default());
+        let l = layout(line, &ts, &ParagraphStyle::default());
         let mut m = filmcraft_text::Mask { w: ow, h: oh, a: std::mem::take(&mut cover) };
         render::draw(&l, &render::at(xs[i], baseline.round()), &mut m, (ox, oy));
         cover = m.a;
+        let words: Vec<&str> = line.split(' ').collect();
+        if let Some(k) = active.and_then(|a| a.checked_sub(first_word)).filter(|k| *k < words.len()) {
+            let before = if k == 0 { String::new() } else { format!("{} ", words[..k].join(" ")) };
+            let x0 = xs[i] + measure(&before, &ts);
+            match style.highlight {
+                CaptionHighlight::Box => {
+                    let pad = (px * 0.18).round();
+                    let r = [x0 - pad, lt + lh * 0.06, x0 + measure(words[k], &ts) + pad, lt + lh * 0.94];
+                    let radius = (px * 0.22).min((r[3] - r[1]) / 2.0);
+                    for y in (r[1].floor() as i32).max(oy)..(r[3].ceil() as i32).min(oy + oh as i32) {
+                        for x in (r[0].floor() as i32).max(ox)..(r[2].ceil() as i32).min(ox + ow as i32) {
+                            let j = (y - oy) as usize * ow + (x - ox) as usize;
+                            lit[j] = lit[j].max(rounded_rect_cover(x as f32 + 0.5, y as f32 + 0.5, r, radius));
+                        }
+                    }
+                }
+                CaptionHighlight::Color => {
+                    let wl = layout(words[k], &ts, &ParagraphStyle::default());
+                    let mut m = filmcraft_text::Mask { w: ow, h: oh, a: std::mem::take(&mut lit) };
+                    render::draw(&wl, &render::at(x0, baseline.round()), &mut m, (ox, oy));
+                    lit = m.a;
+                }
+                CaptionHighlight::None => {}
+            }
+        }
+        first_word += words.len();
     }
     let stroke = if outline > 0.0 { dilate(&cover, ow, oh, outline) } else { Vec::new() };
-    let (tc, bc, oc) = (lin(style.color), lin(style.background_color), lin(style.outline_color));
+    let (tc, bc, oc, hc) = (lin(style.color), lin(style.background_color), lin(style.outline_color), lin(style.highlight_color));
+    let is_box = style.highlight == CaptionHighlight::Box;
     let mut out = vec![0.0f32; ow * oh * 4];
     for j in 0..ow * oh {
         let mut p = [0.0f32; 4];
@@ -194,10 +249,21 @@ pub fn render_caption(c: &Caption, style: &CaptionStyle, w: usize, h: usize) -> 
             }
         };
         over(&mut p, bc, bg[j]);
+        let l = lit.get(j).copied().unwrap_or(0.0);
+        if is_box {
+            over(&mut p, hc, l);
+        }
         if !stroke.is_empty() {
             over(&mut p, oc, stroke[j]);
         }
-        over(&mut p, tc, cover[j]);
+        // the lit word's glyphs take the highlight colour (edges blend with the text colour)
+        let text = if !is_box && l > 0.0 && cover[j] > 0.0 {
+            let k = (l / cover[j]).min(1.0);
+            [0, 1, 2, 3].map(|c| tc[c] + (hc[c] - tc[c]) * k)
+        } else {
+            tc
+        };
+        over(&mut p, text, cover[j]);
         out[j * 4..j * 4 + 4].copy_from_slice(&p);
     }
     Some(Overlay { x: ox, y: oy, w: ow, h: oh, px: out })
@@ -237,7 +303,7 @@ pub fn track_overlay(track: &CaptionTrack, t: Tick, w: usize, h: usize) -> Optio
         return None;
     }
     let c = track.caption_at(t)?;
-    render_caption(c, &track.style, w, h)
+    render_caption_at(c, &track.style, Some(t - c.start), w, h)
 }
 
 /// Overlays of every visible caption track of a sequence at `t`, bottom track first.
@@ -248,10 +314,81 @@ pub fn sequence_overlays(seq: &Sequence, t: Tick, w: usize, h: usize) -> Vec<Ove
 #[cfg(test)]
 mod tests {
     use super::*;
-    use filmcraft_project::{CaptionFormat, ClipId, TrackId};
+    use filmcraft_project::{CaptionFormat, CaptionWord, ClipId, TrackId};
 
     fn cap(text: &str) -> Caption {
-        Caption { id: ClipId(1), start: Tick(0), duration: Tick(100), text: text.into(), speaker: None, cue_id: None, settings: String::new() }
+        Caption {
+            id: ClipId(1),
+            start: Tick(0),
+            duration: Tick(100),
+            text: text.into(),
+            speaker: None,
+            cue_id: None,
+            settings: String::new(),
+            words: Vec::new(),
+        }
+    }
+
+    fn timed(text: &str, words: &[(i64, i64)]) -> Caption {
+        let mut c = cap(text);
+        c.duration = Tick(1000);
+        c.words = words.iter().map(|&(a, b)| CaptionWord { start: Tick(a), end: Tick(b) }).collect();
+        c
+    }
+
+    /// Red pixels of an overlay: how many and their mean x.
+    fn reds(o: &Overlay) -> (usize, f32) {
+        let (mut n, mut sx) = (0, 0.0);
+        for (i, p) in o.px.chunks(4).enumerate() {
+            if p[3] > 0.5 && p[0] > 0.5 * p[3] && p[1] < 0.1 * p[3] {
+                n += 1;
+                sx += (i % o.w) as f32;
+            }
+        }
+        (n, if n > 0 { sx / n as f32 } else { 0.0 })
+    }
+
+    #[test]
+    fn the_track_font_is_used() {
+        let inter = render_caption(&cap("Hello world"), &CaptionStyle::default(), 1920, 1080).unwrap();
+        let mono = CaptionStyle { font: "JetBrains Mono".into(), font_style: "Regular".into(), ..Default::default() };
+        let m = render_caption(&cap("Hello world"), &mono, 1920, 1080).unwrap();
+        assert_ne!(inter.w, m.w, "another face sets the line at another width");
+        let heavier = CaptionStyle { font_style: "Black".into(), ..Default::default() };
+        let b = render_caption(&cap("Hello world"), &heavier, 1920, 1080).unwrap();
+        let ink = |o: &Overlay| o.px.chunks(4).filter(|p| p[0] > 0.9).count();
+        assert!(ink(&b) > ink(&inter), "a heavier style inks more pixels");
+    }
+
+    #[test]
+    fn the_spoken_word_is_lit() {
+        let st = CaptionStyle { background: false, highlight: CaptionHighlight::Color, highlight_color: [255, 0, 0, 255], ..Default::default() };
+        let c = timed("uno dos", &[(0, 400), (500, 900)]);
+        let o = render_caption_at(&c, &st, Some(Tick(600)), 1920, 1080).unwrap();
+        let (n, x) = reds(&o);
+        assert!(n > 200 && x > o.w as f32 / 2.0, "the second word is red: {n} px at x {x} of {}", o.w);
+        let o = render_caption_at(&c, &st, Some(Tick(450)), 1920, 1080).unwrap();
+        let (n, x) = reds(&o);
+        assert!(n > 200 && x < o.w as f32 / 2.0, "the first word stays lit through the pause: {n} px at x {x}");
+        // nothing lit without a time, without word times, or with the highlight off
+        assert_eq!(reds(&render_caption(&c, &st, 1920, 1080).unwrap()).0, 0);
+        assert_eq!(reds(&render_caption_at(&cap("uno dos"), &st, Some(Tick(600)), 1920, 1080).unwrap()).0, 0);
+        let off = CaptionStyle { highlight: CaptionHighlight::None, ..st.clone() };
+        assert_eq!(reds(&render_caption_at(&c, &off, Some(Tick(600)), 1920, 1080).unwrap()).0, 0);
+        // Box: a red box behind the word, the text stays white
+        let bx = CaptionStyle { highlight: CaptionHighlight::Box, ..st.clone() };
+        let o = render_caption_at(&c, &bx, Some(Tick(600)), 1920, 1080).unwrap();
+        let (n_box, x) = reds(&o);
+        assert!(n_box > 2000 && x > o.w as f32 / 2.0, "box behind the second word: {n_box} px at x {x}");
+        assert!(o.px.chunks(4).any(|p| p[0] > 0.9 && p[1] > 0.9 && p[2] > 0.9), "white text on it");
+        // the track overlay lights by the time inside the caption
+        let mut t = CaptionTrack::new(TrackId(1), "S".into(), CaptionFormat::Subtitle);
+        t.style = st;
+        let mut c2 = c.clone();
+        c2.start = Tick(10_000);
+        t.captions.push(c2);
+        let o = track_overlay(&t, Tick(10_600), 1920, 1080).unwrap();
+        assert!(reds(&o).1 > o.w as f32 / 2.0);
     }
 
     #[test]

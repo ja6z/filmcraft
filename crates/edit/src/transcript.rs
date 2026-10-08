@@ -18,7 +18,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use filmcraft_project::{Caption, ClipId, ItemId, Sequence, TrackId, Transcript};
+use filmcraft_project::{Caption, CaptionWord, ClipId, ItemId, Sequence, TrackId, Transcript};
 use filmcraft_time::{FrameRate, TICKS_PER_SECOND, Tick, TimeRange};
 
 use crate::EditCtx;
@@ -311,6 +311,8 @@ pub struct CaptionBlock {
     pub speaker: Option<String>,
     /// The word index range it shows.
     pub words: std::ops::Range<usize>,
+    /// Timeline (start, end) of each word of `text`, in order (for the word-by-word highlight).
+    pub word_times: Vec<(Tick, Tick)>,
 }
 
 /// Lay words out as caption blocks: words fill lines of at most `max_chars` (a longer single word
@@ -379,7 +381,9 @@ pub fn caption_blocks(words: &[SeqWord], rules: &CaptionRules, rate: FrameRate) 
         if end < words[g.end - 1].end {
             end += fd;
         }
-        out.push(CaptionBlock { start, end: end.max(start + fd), text: text_lines.join("\n"), speaker: words[g.start].speaker.clone(), words: g });
+        // one time per word of the text (a "word" holding a space counts once per part)
+        let word_times = words[g.clone()].iter().flat_map(|w| w.text.split_whitespace().map(|_| (w.start, w.end))).collect();
+        out.push(CaptionBlock { start, end: end.max(start + fd), text: text_lines.join("\n"), speaker: words[g.start].speaker.clone(), words: g, word_times });
     }
     // no overlaps, minimum duration (into the silence after a block, never over the next one)
     for i in 0..out.len() {
@@ -419,6 +423,7 @@ pub fn blocks_to_captions(blocks: &[CaptionBlock], ctx: &mut EditCtx) -> Vec<Cap
             speaker: b.speaker.clone(),
             cue_id: None,
             settings: String::new(),
+            words: b.word_times.iter().map(|&(s, e)| CaptionWord { start: s - b.start, end: e - b.start }).collect(),
         })
         .collect()
 }
