@@ -160,9 +160,11 @@ impl PlaybackRes {
     }
 }
 
-/// Header mode (Import / Edit / Export).
+/// Header mode (Home / Import / Edit / Export).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Mode {
+    /// The start page: new / open / recent projects.
+    Home,
     Import,
     #[default]
     Edit,

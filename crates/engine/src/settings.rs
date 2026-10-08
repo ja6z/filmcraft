@@ -29,11 +29,15 @@ pub const PREFS_VERSION: u32 = 2;
 
 // ------------------------------------------------------------------ category values
 
+/// How many recent projects are remembered (the Home page lists them).
+pub const RECENT_PROJECTS: usize = 30;
+
 /// Settings ▸ General.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct GeneralPrefs {
-    /// "At Startup": `showHome` (FilmCraft: the demo project), `openMostRecent`, `emptyProject`.
+    /// "At Startup": `showHome` (the Home page with recent projects), `openMostRecent`,
+    /// `emptyProject`.
     pub at_startup: String,
     /// "When Opening a Project": `showOpenDialog` | `showHome`.
     pub when_opening_project: String,
@@ -54,6 +58,9 @@ pub struct GeneralPrefs {
     pub show_mask_tracker_preview: bool,
     /// Most recently opened / saved projects (newest first; not shown in the dialog).
     pub recent_projects: Vec<String>,
+    /// When each recent project was last opened (Unix seconds), for the Home page.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub recent_opened: BTreeMap<String, i64>,
 }
 
 impl Default for GeneralPrefs {
@@ -75,6 +82,7 @@ impl Default for GeneralPrefs {
             show_project_bin_in_tab: true,
             show_mask_tracker_preview: true,
             recent_projects: Vec::new(),
+            recent_opened: BTreeMap::new(),
         }
     }
 }
@@ -1144,18 +1152,28 @@ impl crate::autosave::Preferences {
         }
         let mut v = self.to_value();
         let d = Self::default().to_value();
-        let keep = self.general.recent_projects.clone();
+        let keep = (self.general.recent_projects.clone(), self.general.recent_opened.clone());
         v[id] = d[id].clone();
         *self = serde_json::from_value(v).map_err(|e| e.to_string())?;
-        self.general.recent_projects = keep;
+        (self.general.recent_projects, self.general.recent_opened) = keep;
         Ok(())
     }
-    /// Remember a project as the most recent one.
-    pub fn note_recent(&mut self, path: &str) {
-        let r = &mut self.general.recent_projects;
-        r.retain(|p| p != path);
-        r.insert(0, path.to_string());
-        r.truncate(10);
+    /// Remember a project as the most recent one; `opened_at` (Unix seconds) records an open.
+    pub fn note_recent(&mut self, path: &str, opened_at: Option<i64>) {
+        let g = &mut self.general;
+        g.recent_projects.retain(|p| p != path);
+        g.recent_projects.insert(0, path.to_string());
+        g.recent_projects.truncate(RECENT_PROJECTS);
+        if let Some(t) = opened_at {
+            g.recent_opened.insert(path.to_string(), t);
+        }
+        let keep = &g.recent_projects;
+        g.recent_opened.retain(|p, _| keep.contains(p));
+    }
+    /// Drop a project from the recent list (Home ▸ Remove from Recents).
+    pub fn forget_recent(&mut self, path: &str) {
+        self.general.recent_projects.retain(|p| p != path);
+        self.general.recent_opened.remove(path);
     }
 }
 
@@ -1353,14 +1371,17 @@ impl Session {
         enforce_policy(&dir, &self.prefs.media_cache, keep.as_deref(), std::time::SystemTime::now());
     }
 
-    /// Note a project file as the most recent one (General ▸ At Startup ▸ Open Most Recent).
-    pub fn note_recent_project(&mut self) {
+    /// Note a project file as the most recent one (General ▸ At Startup ▸ Open Most Recent, the
+    /// Home page). `opened`: it was just opened (a save records the time only the first time).
+    pub fn note_recent_project(&mut self, opened: bool) {
         let Some(p) = self.path.clone() else { return };
-        if self.prefs.general.recent_projects.first() == Some(&p) {
+        let g = &self.prefs.general;
+        let stamp = opened || !g.recent_opened.contains_key(&p);
+        if g.recent_projects.first() == Some(&p) && !stamp {
             return;
         }
         let mut next = self.prefs.clone();
-        next.note_recent(&p);
+        next.note_recent(&p, stamp.then(crate::autosave::unix_now));
         let _ = self.set_prefs(next);
     }
 }

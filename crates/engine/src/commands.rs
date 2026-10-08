@@ -2435,6 +2435,7 @@ fn build() -> Vec<CommandSpec> {
     v.extend(crate::shortcuts::commands());
     v.extend(crate::relink::commands());
     v.extend(crate::proxies::commands());
+    v.extend(crate::recent::commands());
     v.extend(crate::project_manager::commands());
     v.extend(crate::masks::commands());
     v.extend(crate::presets::commands());
@@ -3120,7 +3121,8 @@ fn write_project(s: &mut Session, path: &str, adopt: bool) -> Result<Value> {
     if adopt {
         s.path = Some(path.to_string());
         s.previews_follow_path();
-        s.note_recent_project();
+        s.note_recent_project(false);
+        crate::recent::write_thumbnail(s);
         s.saved_revision = s.revision;
         s.loaded_schema = filmcraft_format::SCHEMA_VERSION;
     }
@@ -3170,7 +3172,10 @@ fn open_project(s: &mut Session, path: &str) -> Result<Value> {
     if let Some(seq) = s.state.active_sequence {
         s.events.push(crate::Event::OpenSequence(seq));
     }
-    s.note_recent_project();
+    s.note_recent_project(true);
+    if crate::recent::thumbnail_for(s, path).is_none_or(|t| !t.exists()) {
+        crate::recent::write_thumbnail(s);
+    }
     s.loaded_schema = from;
     if migrated {
         s.toast(format!("Upgraded project from schema v{from} to v{}; the original is kept as a backup when you save", filmcraft_format::SCHEMA_VERSION));

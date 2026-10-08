@@ -1148,6 +1148,10 @@ impl FilmcraftApp {
         for ev in self.session.drain_events() {
             match ev {
                 filmcraft_engine::Event::OpenSequence(_) => {
+                    // a project opened from Home (or by a script) goes to editing
+                    if self.ui.mode == state::Mode::Home {
+                        self.ui.mode = state::Mode::Edit;
+                    }
                     // show the sequence with its own view (or fitted, the first time)
                     self.timeline_view_of = None;
                     self.ui.dock.restore_timeline();
@@ -1183,6 +1187,7 @@ impl FilmcraftApp {
         let body = egui::Rect::from_min_max(egui::pos2(full.min.x + 1.0, header.max.y + 1.0), egui::pos2(full.max.x - 1.0, full.max.y - status_h - 2.0));
         match self.ui.mode {
             state::Mode::Edit => self.dock_area(ui, body),
+            state::Mode::Home => panels::home_mode::show(self, ui, body),
             state::Mode::Import => panels::import_mode::show(self, ui, body),
             state::Mode::Export => panels::export_mode::show(self, ui, body),
         }
@@ -1420,7 +1425,9 @@ impl eframe::App for FilmcraftApp {
             // Nothing is shown while the window is hidden: not a dropped frame.
             self.playback.hidden = true;
         }
-        self.timeline_still = if self.ui.timeline.animating() { 0 } else { self.timeline_still.saturating_add(1) };
+        // the timeline only animates (and registers elements) while Edit mode shows it
+        let zooming = self.ui.mode == state::Mode::Edit && self.ui.timeline.animating();
+        self.timeline_still = if zooming { 0 } else { self.timeline_still.saturating_add(1) };
         let had_synthetic = !self.synthetic.is_empty();
         self.drain_control(ctx);
         if !self.synthetic.is_empty() && !had_synthetic {

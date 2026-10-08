@@ -13,6 +13,7 @@ pub mod export_mode;
 pub mod file_dialogs;
 pub mod graphics;
 pub mod graphics_templates;
+pub mod home_mode;
 pub mod import_mode;
 pub mod interchange_export;
 pub mod keyboard;

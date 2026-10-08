@@ -115,6 +115,7 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     uic!("tool.hand", "Hand Tool", [], Some("H")),
     uic!("tool.zoom", "Zoom Tool", [], Some("Z")),
     uic!("tool.type", "Type Tool", [], Some("T")),
+    uic!("mode.home", "Home", ["File"], None),
     uic!("mode.import", "Import", [], None),
     uic!("mode.edit", "Edit", [], None),
     uic!("mode.export", "Export", ["File", "Export"], Some("Cmd+M")),
@@ -275,6 +276,10 @@ pub fn invoke(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: Val
         }
         "view.zoomToSequence" => {
             app.ui.timeline.fit_pending = true;
+            return Ok(Value::Null);
+        }
+        "mode.home" => {
+            app.ui.mode = Mode::Home;
             return Ok(Value::Null);
         }
         "mode.import" => {

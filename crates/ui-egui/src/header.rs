@@ -26,14 +26,15 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let mut x = rect.min.x + if app.integrated_titlebar { 104.0 } else { 14.0 };
     // Home
     let home = Rect::from_center_size(pos2(x + 10.0, rect.center().y), vec2(26.0, 26.0));
-    let hresp = ui.interact(home, egui::Id::new("hdr-home"), Sense::click()).on_hover_text("Home");
+    let hresp = ui.interact(home, egui::Id::new("hdr-home"), Sense::click()).on_hover_text("Home: recent projects");
     app.auto.add("header.home", home, "Home");
-    if hresp.hovered() {
+    let at_home = app.ui.mode == Mode::Home;
+    if hresp.hovered() || at_home {
         p.rect_filled(home, 4.0, t.hover);
     }
-    icons::paint(&p, home.shrink(5.0), Icon::Home, if hresp.hovered() { t.text } else { t.text_dim });
+    icons::paint(&p, home.shrink(5.0), Icon::Home, if hresp.hovered() || at_home { t.text } else { t.text_dim });
     if hresp.clicked() {
-        app.ui.mode = Mode::Import;
+        app.ui.mode = Mode::Home;
     }
     x = home.max.x + 16.0;
     // Mode tabs (14 pt; active = primary text with a 2 pt underline under the label)
