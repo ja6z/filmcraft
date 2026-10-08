@@ -850,7 +850,11 @@ impl FilmcraftApp {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
                 filmcraft_engine::media_pool::media_key(m).hash(&mut h);
-                (m.proxy.is_some() && self.session.media.use_proxies()).hash(&mut h);
+                let proxied = m.proxy.is_some() && self.session.media.use_proxies();
+                proxied.hash(&mut h);
+                if proxied {
+                    m.proxy_ranges.hash(&mut h);
+                }
                 h.finish()
             }
             _ => self.session.revision,

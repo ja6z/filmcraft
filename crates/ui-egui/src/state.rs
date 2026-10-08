@@ -646,6 +646,8 @@ pub struct ProxyDraft {
     pub preset: String,
     /// Empty = a Proxies folder next to the original media.
     pub destination: String,
+    /// Proxy only the parts the sequences use (plus handles).
+    pub only_used: bool,
 }
 
 /// File ▸ Project Manager….

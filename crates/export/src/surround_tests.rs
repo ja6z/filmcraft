@@ -63,6 +63,7 @@ fn surround() -> (Arc<Project>, ItemId, SourceMap) {
             markers: vec![],
             offline: false,
             proxy: None,
+            proxy_ranges: Vec::new(),
             identity: None,
         }),
         None,

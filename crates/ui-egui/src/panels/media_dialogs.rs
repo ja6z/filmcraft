@@ -74,7 +74,8 @@ pub fn route(app: &mut FilmcraftApp, id: &str, params: &Value) -> Option<Result<
         })),
         "media.createProxies" => Some(enabled(app, id).map(|_| {
             let items = app.session.state.project_selection.iter().map(|i| i.0).collect();
-            app.ui.create_proxies = Some(ProxyDraft { items, preset: filmcraft_engine::proxies::DEFAULT_PROXY_PRESET.into(), destination: String::new() });
+            app.ui.create_proxies =
+                Some(ProxyDraft { items, preset: filmcraft_engine::proxies::DEFAULT_PROXY_PRESET.into(), destination: String::new(), only_used: false });
             json!({"dialog": "createProxies"})
         })),
         "media.attachProxies" | "media.reconnectFullRes" => {
@@ -407,6 +408,10 @@ fn create_proxies(app: &mut FilmcraftApp, ctx: &egui::Context) {
             }
         }
         ui.add_space(4.0);
+        let r = ui.checkbox(&mut d.only_used, "Only the parts used in sequences (+1 s handles)");
+        push(&mut elems, "proxies.onlyUsed", &r, "Only the parts used in sequences");
+        r.on_hover_text("Much faster for long recordings used for a few seconds. Parts outside the proxy play from the original media.");
+        ui.add_space(4.0);
         ui.label(RichText::new("Destination").strong());
         ui.horizontal(|ui| {
             let r = ui.add(egui::TextEdit::singleline(&mut d.destination).desired_width(320.0).hint_text("Next to the original media, in a Proxies folder"));
@@ -432,7 +437,7 @@ fn create_proxies(app: &mut FilmcraftApp, ctx: &egui::Context) {
         d.destination = f;
     }
     if ok {
-        let p = json!({"items": d.items, "preset": d.preset, "destination": if d.destination.is_empty() { Value::Null } else { json!(d.destination) }});
+        let p = json!({"items": d.items, "preset": d.preset, "destination": if d.destination.is_empty() { Value::Null } else { json!(d.destination) }, "onlyUsed": d.only_used});
         match app.session.execute("media.createProxies", p) {
             Ok(v) => app.ui.status = format!("Creating {} proxy file(s)…", v["outputs"].as_array().map_or(0, Vec::len)),
             Err(e) => app.ui.status = e.to_string(),

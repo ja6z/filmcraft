@@ -268,6 +268,7 @@ pub(crate) fn media_clip(media: MediaRef, info: MediaInfo) -> MediaClip {
         markers: Vec::new(),
         offline: false,
         proxy: None,
+        proxy_ranges: Vec::new(),
         identity: None,
     }
 }

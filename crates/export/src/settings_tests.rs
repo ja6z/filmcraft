@@ -54,6 +54,7 @@ fn matte(color: [f32; 4], w: u32, h: u32, tone_db: Option<f32>) -> (Arc<Project>
                 markers: vec![],
                 offline: false,
                 proxy: None,
+                proxy_ranges: Vec::new(),
                 identity: None,
             }),
             None,

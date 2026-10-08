@@ -795,6 +795,7 @@ fn offline_file(s: &mut Session, p: &Value) -> Result<Value> {
                 markers: vec![],
                 offline: true,
                 proxy: None,
+                proxy_ranges: Vec::new(),
                 identity: None,
             }),
             None,
@@ -1572,6 +1573,7 @@ fn breakout_to_mono(s: &mut Session, p: &Value) -> Result<Value> {
                 mm.mark_out = None;
                 mm.markers.clear();
                 mm.proxy = None;
+                mm.proxy_ranges.clear();
                 let id = pr.add_item(&format!("{} {suffix}", it.name), it.label, ItemKind::Media(mm), bin);
                 made.push(id);
             }

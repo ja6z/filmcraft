@@ -5,8 +5,13 @@
 //!   LT or H.264 at ¼ or ½ size, audio included) and attaches the results when it finishes
 //!   ([`poll`] applies finished jobs; the frontend calls it every frame through
 //!   `Session::poll_persistence`).
+//! - **Only the used parts.** With `onlyUsed`, a proxy holds just the parts of the clip that
+//!   video clips in the project's sequences use, plus handles, back to back and without audio
+//!   ([`used_parts`]); the clip records where each part sits (`MediaClip::proxy_ranges`) and
+//!   reads everything else from the original. A long recording used for a few seconds proxies in
+//!   seconds instead of minutes. When the parts cover most of the clip, the whole clip is proxied.
 //! - **Attach.** A proxy must have the original's duration (±1 frame) and frame rate; its frame
-//!   size and aspect may differ.
+//!   size and aspect may differ. A partial proxy must last as long as its parts.
 //! - **Toggle.** `media.toggleProxies` flips Preferences ▸ Media ▸ Enable proxies; the media pool
 //!   then hands proxies to monitors and playback. Export always uses full resolution.
 //! - **Ingest.** With ingest enabled, `file.import` copies (verified by fingerprint), transcodes
@@ -17,12 +22,12 @@ use std::sync::{Arc, Mutex};
 
 use filmcraft_export::{ExportSettings, Format, Progress, Report};
 use filmcraft_media::{MediaKind, SharedSource};
-use filmcraft_project::{IngestAction, ItemId, ItemKind, MediaClip, MediaRef, Project, SequenceSettings, TrackKind};
+use filmcraft_project::{IngestAction, ItemId, ItemKind, MediaClip, MediaRef, Project, ProxyRange, SequenceSettings, TrackKind};
 use filmcraft_time::{Tick, TimeRange};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::commands::{CommandSpec, always, bad, bool_p, str_p, u64_p};
+use crate::commands::{CommandSpec, always, bad, bool_p, f64_p, str_p, u64_p};
 use crate::{EngineError, Result, Session};
 
 /// A proxy / transcode preset.
@@ -82,8 +87,8 @@ pub enum OnDone {
 pub struct PendingJob {
     pub job: u64,
     pub on_done: OnDone,
-    /// (item, output path) for each finished output.
-    pub outputs: Arc<Mutex<Vec<(ItemId, String)>>>,
+    /// (item, output path, parts of a partial proxy) for each finished output.
+    pub outputs: Arc<Mutex<Vec<(ItemId, String, Vec<ProxyRange>)>>>,
 }
 
 /// Transcode `range` (whole media when None) of one media clip to `out` with `preset`, blocking.
@@ -93,6 +98,22 @@ pub fn transcode(
     name: &str,
     src: SharedSource,
     range: Option<TimeRange>,
+    out: &str,
+    preset: &Preset,
+    progress: &Progress,
+) -> std::result::Result<Report, String> {
+    let range = range.unwrap_or(TimeRange { start: Tick::ZERO, duration: clip.info.duration });
+    transcode_parts(clip, name, src, &[range], true, out, preset, progress)
+}
+
+/// Transcode `parts` (media ranges) of one media clip back to back to `out`, blocking.
+#[allow(clippy::too_many_arguments)]
+fn transcode_parts(
+    clip: &MediaClip,
+    name: &str,
+    src: SharedSource,
+    parts: &[TimeRange],
+    audio: bool,
     out: &str,
     preset: &Preset,
     progress: &Progress,
@@ -112,15 +133,18 @@ pub fn transcode(
     c.proxy = None;
     let item = p.add_item(name, filmcraft_project::Label::Iris, ItemKind::Media(c), None);
     let has_v = info.video.is_some();
-    let has_a = info.audio.is_some();
+    let has_a = audio && info.audio.is_some();
     let seq = p.new_sequence("transcode", st, usize::from(has_v), usize::from(has_a), None);
-    let range = range.unwrap_or(TimeRange { start: Tick::ZERO, duration: info.duration });
     let mut placed = Vec::new();
-    if has_v && let Some(ti) = p.make_track_item(item, TrackKind::Video, Tick::ZERO, range, rate) {
-        placed.push((TrackKind::Video, ti));
-    }
-    if has_a && let Some(ti) = p.make_track_item(item, TrackKind::Audio, Tick::ZERO, range, rate) {
-        placed.push((TrackKind::Audio, ti));
+    let mut at = Tick::ZERO;
+    for &range in parts {
+        if has_v && let Some(ti) = p.make_track_item(item, TrackKind::Video, at, range, rate) {
+            placed.push((TrackKind::Video, ti));
+        }
+        if has_a && let Some(ti) = p.make_track_item(item, TrackKind::Audio, at, range, rate) {
+            placed.push((TrackKind::Audio, ti));
+        }
+        at += range.duration;
     }
     let q = p.sequence_mut(seq).ok_or("no sequence")?;
     for (k, ti) in placed {
@@ -152,6 +176,65 @@ pub fn frame_count(clip: &MediaClip, range: Option<TimeRange>) -> u64 {
     if clip.info.video.is_none() { 1 } else { rate.frame_at(d).max(1) as u64 }
 }
 
+/// The parts of `media` that video clips in the project's sequences use (directly or through
+/// subclips), widened by `handles`, snapped to its frames and merged when closer than `handles`,
+/// laid out back to back (`at`). None when no video clip uses it.
+pub fn used_parts(p: &Project, media: ItemId, handles: Tick) -> Option<Vec<ProxyRange>> {
+    let m = p.item(media)?.as_media()?;
+    let rate = m.frame_rate();
+    let fd = rate.frame_duration();
+    let end = rate.snap(m.info.duration);
+    let handles = handles.max(Tick::ZERO);
+    let mut spans: Vec<(Tick, Tick)> = Vec::new();
+    for it in p.sequences() {
+        let Some(seq) = p.sequence(it.id) else { continue };
+        for ti in seq.video_tracks.iter().flat_map(|t| &t.items) {
+            let target = match p.item(ti.item).map(|i| &i.kind) {
+                Some(ItemKind::Subclip { parent, .. }) => *parent,
+                _ => ti.item,
+            };
+            if target != media || ti.duration <= Tick::ZERO {
+                continue;
+            }
+            let a = ti.source_time_at(ti.start);
+            let b = ti.source_time_at(ti.end() - Tick(1));
+            let lo = rate.snap((a.min(b) - handles).max(Tick::ZERO));
+            // through the end of the last frame used, plus handles
+            let hi = rate.snap(a.max(b) + handles + fd).min(end);
+            if hi > lo {
+                spans.push((lo, hi));
+            }
+        }
+    }
+    if spans.is_empty() {
+        return None;
+    }
+    spans.sort();
+    let mut merged: Vec<(Tick, Tick)> = Vec::new();
+    for (lo, hi) in spans {
+        match merged.last_mut() {
+            Some(last) if lo <= last.1 + handles => last.1 = last.1.max(hi),
+            _ => merged.push((lo, hi)),
+        }
+    }
+    let mut at = Tick::ZERO;
+    Some(
+        merged
+            .into_iter()
+            .map(|(lo, hi)| {
+                let r = ProxyRange { media: TimeRange::from_bounds(lo, hi), at };
+                at += hi - lo;
+                r
+            })
+            .collect(),
+    )
+}
+
+/// Total length of a partial proxy's parts.
+fn parts_duration(parts: &[ProxyRange]) -> Tick {
+    parts.iter().fold(Tick::ZERO, |a, r| a + r.media.duration)
+}
+
 /// `<dir>/<stem><suffix>.<ext>`, numbered when the name is taken.
 pub fn unique_path(dir: &Path, stem: &str, suffix: &str, ext: &str, taken: &[String]) -> PathBuf {
     let mut n = 1;
@@ -181,30 +264,31 @@ fn items_param(s: &Session, p: &Value) -> Vec<ItemId> {
     }
 }
 
-/// Start a background transcode job over `work` (item, output path, preset). Returns the job id.
-pub fn start_job(s: &mut Session, label: String, work: Vec<(ItemId, String, &'static Preset)>, on_done: OnDone, wait: bool) -> Result<u64> {
+/// Start a background transcode job over `work` (item, output path, preset, parts of a partial
+/// proxy — empty for the whole clip). Returns the job id.
+pub fn start_job(s: &mut Session, label: String, work: Vec<(ItemId, String, &'static Preset, Vec<ProxyRange>)>, on_done: OnDone, wait: bool) -> Result<u64> {
     let mut tasks = Vec::new();
     let mut total = 0;
-    for (item, out, pr) in work {
+    for (item, out, pr, parts) in work {
         let (clip, _, name) = media_path(&s.project, item).ok_or_else(|| bad("media.createProxies", format!("item {} is not file media", item.0)))?;
         let src = s.media.full_res_source(&s.project, item, &*s.services).ok_or_else(|| EngineError::Other(format!("{name}: no source")))?;
         if s.media.offline_status(item).is_some() {
             return Err(EngineError::Other(format!("{name} is offline; link it first")));
         }
-        total += frame_count(&clip, None);
-        tasks.push((item, clip, name, src, out, pr));
+        total += if parts.is_empty() { frame_count(&clip, None) } else { parts.iter().map(|r| frame_count(&clip, Some(r.media))).sum() };
+        tasks.push((item, clip, name, src, out, pr, parts));
     }
     let id = s.jobs.iter().map(|j| j.id).max().unwrap_or(0) + 1;
     let job = crate::Job { id, label, progress: Default::default(), result: Default::default() };
     job.progress.total.store(total, std::sync::atomic::Ordering::Relaxed);
-    let outputs: Arc<Mutex<Vec<(ItemId, String)>>> = Arc::default();
+    let outputs: Arc<Mutex<Vec<(ItemId, String, Vec<ProxyRange>)>>> = Arc::default();
     let (prog, res, outs) = (job.progress.clone(), job.result.clone(), outputs.clone());
     let run = move || {
         let t0 = std::time::Instant::now();
         let mut bytes = 0;
         let mut err = None;
         let n = tasks.len();
-        for (k, (item, clip, name, src, out, pr)) in tasks.into_iter().enumerate() {
+        for (k, (item, clip, name, src, out, pr, parts)) in tasks.into_iter().enumerate() {
             if prog.cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 err = Some("cancelled".to_string());
                 break;
@@ -213,10 +297,16 @@ pub fn start_job(s: &mut Session, label: String, work: Vec<(ItemId, String, &'st
             if let Some(d) = Path::new(&out).parent() {
                 let _ = std::fs::create_dir_all(d);
             }
-            match transcode(&clip, &name, src, None, &out, pr, &prog) {
+            let r = if parts.is_empty() {
+                transcode(&clip, &name, src, None, &out, pr, &prog)
+            } else {
+                let ranges: Vec<TimeRange> = parts.iter().map(|r| r.media).collect();
+                transcode_parts(&clip, &name, src, &ranges, false, &out, pr, &prog)
+            };
+            match r {
                 Ok(r) => {
                     bytes += r.bytes;
-                    outs.lock().unwrap_or_else(|e| e.into_inner()).push((item, out));
+                    outs.lock().unwrap_or_else(|e| e.into_inner()).push((item, out, parts));
                 }
                 Err(e) => {
                     let _ = std::fs::remove_file(&out);
@@ -270,7 +360,7 @@ pub fn poll(s: &mut Session) {
             continue;
         }
         let r = match pj.on_done {
-            OnDone::AttachProxies => attach(s, &outs, false).map(|_| ()),
+            OnDone::AttachProxies => attach_parts(s, &outs, false).map(|_| ()),
             OnDone::ReplaceMedia => replace_media(s, &outs),
             OnDone::Nothing => Ok(()),
         };
@@ -280,18 +370,21 @@ pub fn poll(s: &mut Session) {
     }
 }
 
-/// Check a proxy file against its clip: duration within one frame, same frame rate.
-fn check_proxy(s: &Session, item: ItemId, path: &str) -> Result<()> {
+/// Check a proxy file against its clip: duration within one frame (of the parts, for a partial
+/// proxy), same frame rate.
+fn check_proxy(s: &Session, item: ItemId, path: &str, parts: &[ProxyRange]) -> Result<()> {
     let (clip, _, name) = media_path(&s.project, item).ok_or_else(|| bad("media.attachProxies", format!("item {} is not file media", item.0)))?;
     let src = s.media.open_file(path, &*s.services).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
     let pi = src.info();
     let fd = clip.info.frame_rate().frame_duration();
-    if (pi.duration - clip.info.duration).0.abs() > fd.0 {
+    let want = if parts.is_empty() { clip.info.duration } else { parts_duration(parts) };
+    if (pi.duration - want).0.abs() > fd.0 {
         return Err(EngineError::Other(format!(
-            "{}: the proxy is {:.3}s long but {name} is {:.3}s",
+            "{}: the proxy is {:.3}s long but {} {:.3}s",
             Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
             pi.duration.seconds(),
-            clip.info.duration.seconds()
+            if parts.is_empty() { format!("{name} is") } else { format!("the used parts of {name} are") },
+            want.seconds()
         )));
     }
     if let (Some(a), Some(b)) = (&pi.video, &clip.info.video)
@@ -305,27 +398,34 @@ fn check_proxy(s: &Session, item: ItemId, path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Attach proxies (checked unless `force`). One undo step.
+/// Attach whole-clip proxies (checked unless `force`). One undo step.
 pub fn attach(s: &mut Session, pairs: &[(ItemId, String)], force: bool) -> Result<Value> {
+    let with_parts: Vec<(ItemId, String, Vec<ProxyRange>)> = pairs.iter().map(|(i, p)| (*i, p.clone(), Vec::new())).collect();
+    attach_parts(s, &with_parts, force)
+}
+
+/// Attach proxies, partial ones with their parts (checked unless `force`). One undo step.
+pub fn attach_parts(s: &mut Session, pairs: &[(ItemId, String, Vec<ProxyRange>)], force: bool) -> Result<Value> {
     if !force {
-        for (i, p) in pairs {
-            check_proxy(s, *i, p)?;
+        for (i, p, parts) in pairs {
+            check_proxy(s, *i, p, parts)?;
         }
     }
     let pairs = pairs.to_vec();
     s.edit("Attach Proxies", |proj, _| {
-        for (i, p) in &pairs {
+        for (i, p, parts) in &pairs {
             if let Some(m) = proj.item_mut(*i).and_then(|it| it.as_media_mut()) {
                 m.proxy = Some(MediaRef::File { path: p.clone() });
+                m.proxy_ranges = parts.clone();
             }
         }
         Ok(())
     })?;
-    Ok(json!({"attached": pairs.iter().map(|(i, p)| json!({"item": i.0, "path": p})).collect::<Vec<_>>()}))
+    Ok(json!({"attached": pairs.iter().map(|(i, p, parts)| json!({"item": i.0, "path": p, "parts": parts.len()})).collect::<Vec<_>>()}))
 }
 
-fn replace_media(s: &mut Session, outs: &[(ItemId, String)]) -> Result<()> {
-    for (i, p) in outs {
+fn replace_media(s: &mut Session, outs: &[(ItemId, String, Vec<ProxyRange>)]) -> Result<()> {
+    for (i, p, _) in outs {
         let q = json!({"item": i.0, "path": p, "force": true, "relinkOthers": false});
         crate::relink::relink(s, &q)?;
     }
@@ -340,7 +440,10 @@ pub fn proxy_dir(media: &str, dest: Option<&str>) -> PathBuf {
     }
 }
 
-/// `media.createProxies {items?, preset?, destination?, wait?}`.
+/// Share of a clip above which "only the used parts" proxies the whole clip.
+const WHOLE_CLIP_SHARE: f64 = 0.8;
+
+/// `media.createProxies {items?, preset?, destination?, onlyUsed?, handles?, wait?}`.
 pub fn create(s: &mut Session, p: &Value) -> Result<Value> {
     let pr = preset(str_p(p, "preset").unwrap_or(DEFAULT_PROXY_PRESET)).ok_or_else(|| bad("media.createProxies", "unknown preset (see media.proxyPresets)"))?;
     let items = items_param(s, p);
@@ -348,6 +451,8 @@ pub fn create(s: &mut Session, p: &Value) -> Result<Value> {
     let dest = str_p(p, "destination")
         .map(str::to_string)
         .or_else(|| s.project.settings.scratch.captured.clone().filter(|d| !d.is_empty()).map(|d| format!("{d}/Proxies")));
+    let only_used = bool_p(p, "onlyUsed").unwrap_or(false);
+    let handles = Tick::from_seconds_f64(f64_p(p, "handles").unwrap_or(1.0).clamp(0.0, 60.0));
     let mut work = Vec::new();
     let mut taken = Vec::new();
     let mut skipped = Vec::new();
@@ -360,15 +465,28 @@ pub fn create(s: &mut Session, p: &Value) -> Result<Value> {
             skipped.push(json!({"item": i.0, "reason": format!("{name} has no video to proxy")}));
             continue;
         }
+        let parts = if only_used {
+            let Some(parts) = used_parts(&s.project, i, handles) else {
+                skipped.push(json!({"item": i.0, "reason": format!("no sequence uses {name}")}));
+                continue;
+            };
+            let share = parts_duration(&parts).seconds() / clip.info.duration.seconds().max(1e-9);
+            if share >= WHOLE_CLIP_SHARE { Vec::new() } else { parts }
+        } else {
+            Vec::new()
+        };
         let stem = Path::new(&path).file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or(name);
         let out = unique_path(&proxy_dir(&path, dest.as_deref()), &stem, "_Proxy", pr.extension, &taken).to_string_lossy().into_owned();
         taken.push(out.clone());
-        work.push((i, out, pr));
+        work.push((i, out, pr, parts));
     }
     if work.is_empty() {
         return Err(EngineError::Other(format!("nothing to proxy: {}", skipped.iter().filter_map(|v| v["reason"].as_str()).collect::<Vec<_>>().join("; "))));
     }
-    let outputs: Vec<Value> = work.iter().map(|(i, o, _)| json!({"item": i.0, "path": o})).collect();
+    let outputs: Vec<Value> = work
+        .iter()
+        .map(|(i, o, _, parts)| json!({"item": i.0, "path": o, "parts": parts.len(), "seconds": if parts.is_empty() { Value::Null } else { json!(parts_duration(parts).seconds()) }}))
+        .collect();
     let n = work.len();
     let label = format!("Create Proxies ({n} clip{})", if n == 1 { "" } else { "s" });
     let attach = bool_p(p, "attach").unwrap_or(true);
@@ -431,7 +549,7 @@ pub fn ingest(s: &mut Session, items: &[ItemId]) -> Result<Value> {
                     _ => Path::new(&path).parent().unwrap_or(Path::new(".")).join("Ingested Media"),
                 };
                 let stem = Path::new(&path).file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or(name);
-                work.push((i, unique_path(&dir, &stem, "", pr.extension, &[]).to_string_lossy().into_owned(), pr));
+                work.push((i, unique_path(&dir, &stem, "", pr.extension, &[]).to_string_lossy().into_owned(), pr, Vec::new()));
             }
             if !work.is_empty() {
                 let id = start_job(s, format!("Ingest: transcode {} clip(s)", work.len()), work, OnDone::ReplaceMedia, false)?;
@@ -450,7 +568,7 @@ pub fn commands() -> Vec<CommandSpec> {
             label: "Create Proxies…",
             menu: &["Clip", "Proxy"],
             shortcut: None,
-            params: r#"{"items":[id]?,"preset":"prores_proxy_quarter|prores_proxy_half|prores_lt_half|h264_quarter|h264_half","destination":str?,"attach":bool=true,"wait":bool=false}"#,
+            params: r#"{"items":[id]?,"preset":"prores_proxy_quarter|prores_proxy_half|prores_lt_half|h264_quarter|h264_half","destination":str?,"onlyUsed":bool=false,"handles":seconds=1,"attach":bool=true,"wait":bool=false}"#,
             enabled: has_file_media,
             run: create,
             journal: true,
@@ -489,6 +607,7 @@ pub fn commands() -> Vec<CommandSpec> {
                         if let Some(m) = proj.item_mut(*i).and_then(|it| it.as_media_mut())
                             && m.proxy.take().is_some()
                         {
+                            m.proxy_ranges.clear();
                             n += 1;
                         }
                     }

@@ -35,6 +35,7 @@ fn make_cut_movie(path: &Path, shots: &[(DemoScene, i64)], w: u32, h: u32) {
             markers: vec![],
             offline: false,
             proxy: None,
+            proxy_ranges: Vec::new(),
             identity: None,
         };
         let item = p.add_item(&format!("shot{k}"), Label::Iris, ItemKind::Media(clip), None);

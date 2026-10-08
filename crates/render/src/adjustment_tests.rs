@@ -31,6 +31,7 @@ fn media(p: &mut Project, map: &mut SourceMap, g: GeneratorSource) -> ItemId {
             markers: vec![],
             offline: false,
             proxy: None,
+            proxy_ranges: Vec::new(),
             identity: None,
         }),
         None,

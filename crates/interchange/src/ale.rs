@@ -237,6 +237,7 @@ mod tests {
             markers: vec![],
             offline: false,
             proxy: None,
+            proxy_ranges: Vec::new(),
             identity: None,
         };
         p.add_item(name, Label::Iris, ItemKind::Media(clip), None)

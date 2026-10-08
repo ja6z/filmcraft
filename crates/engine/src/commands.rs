@@ -420,6 +420,7 @@ fn import_source(
                 markers: vec![],
                 offline: false,
                 proxy: None,
+                proxy_ranges: Vec::new(),
                 identity: Some(identity),
             }),
             bin,

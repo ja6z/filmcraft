@@ -281,6 +281,7 @@ fn execute(
                 if let Some(mm) = proj.item_mut(w.item).and_then(|i| i.as_media_mut()) {
                     mm.info = info;
                     mm.proxy = None;
+                    mm.proxy_ranges.clear();
                 }
             }
         }
@@ -298,6 +299,9 @@ fn execute(
                 (Some((_, to)), None) => Some(MediaRef::File { path: to.clone() }),
                 _ => None,
             };
+            if mm.proxy.is_none() {
+                mm.proxy_ranges.clear();
+            }
         }
     }
     if let Some((from, to)) = previews {

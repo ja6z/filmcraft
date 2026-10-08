@@ -43,6 +43,7 @@ fn make_movie(path: &Path, scene: DemoScene, frames: i64) {
         markers: vec![],
         offline: false,
         proxy: None,
+        proxy_ranges: Vec::new(),
         identity: None,
     };
     let mut p = Project::new("fixture");

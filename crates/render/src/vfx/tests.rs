@@ -1067,6 +1067,7 @@ mod pipeline {
                 markers: vec![],
                 offline: false,
                 proxy: None,
+                proxy_ranges: Vec::new(),
                 identity: None,
             }),
             None,

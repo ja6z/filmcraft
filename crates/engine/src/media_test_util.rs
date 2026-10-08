@@ -36,6 +36,7 @@ pub fn make_movie(path: &Path, scene: DemoScene, w: u32, h: u32, frames: i64) {
         markers: vec![],
         offline: false,
         proxy: None,
+        proxy_ranges: Vec::new(),
         identity: None,
     };
     let item = p.add_item("scene", Label::Iris, ItemKind::Media(clip), None);

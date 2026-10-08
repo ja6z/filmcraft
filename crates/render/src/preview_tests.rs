@@ -21,6 +21,7 @@ fn add_gen(p: &mut Project, g: GeneratorSource) -> ItemId {
             markers: vec![],
             offline: false,
             proxy: None,
+            proxy_ranges: Vec::new(),
             identity: None,
         }),
         None,

@@ -136,6 +136,7 @@ mod tests {
                 markers: vec![],
                 offline: false,
                 proxy: None,
+                proxy_ranges: Vec::new(),
                 identity: None,
             };
             let id = p.add_item("hdr", Label::Iris, ItemKind::Media(clip), None);

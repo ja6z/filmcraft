@@ -9,6 +9,8 @@
 //!   from it. Proxy frames are smaller; the source still reports the full-resolution size, and the
 //!   compositor derives its pixel scale from the frame it gets, so effects and Motion render the
 //!   same picture at lower resolution. Export asks for [`MediaPool::full_res_provider`].
+//! - A partial proxy (only the used parts of a clip) serves the frames it holds and passes the
+//!   rest, and all audio, through to the full-resolution media.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,7 +19,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use filmcraft_frame::{AudioBuffer, VideoFrame};
 use filmcraft_media::generators::GeneratorSource;
 use filmcraft_media::{FrameRequest, MediaError, MediaInfo, MediaSource, Opener, SharedSource};
-use filmcraft_project::{ItemId, ItemKind, MediaClip, MediaRef, Project};
+use filmcraft_project::{ItemId, ItemKind, MediaClip, MediaRef, Project, ProxyRange};
 use filmcraft_render::offline::OfflineReason;
 
 use crate::Services;
@@ -206,9 +208,11 @@ impl MediaPool {
         if proxies
             && !m.offline
             && let Some(MediaRef::File { path }) = &m.proxy
-            && let Some(s) = self.proxy_source(item, path, m, services)
         {
-            return Some(s);
+            let full = if m.proxy_ranges.is_empty() { None } else { self.resolve(p, item, services, false) };
+            if let Some(s) = self.proxy_source(item, path, m, full, services) {
+                return Some(s);
+            }
         }
         let key = media_key(m);
         if let Some((k, s)) = self.sources.read().unwrap_or_else(|e| e.into_inner()).get(&item)
@@ -255,8 +259,15 @@ impl MediaPool {
         self.offline.write().unwrap_or_else(|e| e.into_inner()).insert(item, OfflineStatus { reason, path: path.to_string(), error: error.to_string() });
     }
 
-    fn proxy_source(&self, item: ItemId, path: &str, m: &MediaClip, services: &dyn Services) -> Option<SharedSource> {
-        let key = format!("proxy:{path}");
+    fn proxy_source(&self, item: ItemId, path: &str, m: &MediaClip, full: Option<SharedSource>, services: &dyn Services) -> Option<SharedSource> {
+        let key = if m.proxy_ranges.is_empty() {
+            format!("proxy:{path}")
+        } else {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            m.proxy_ranges.hash(&mut h);
+            format!("proxy:{path}:{:x}:{}", h.finish(), media_key(m))
+        };
         if let Some((k, s)) = self.proxies.read().unwrap_or_else(|e| e.into_inner()).get(&item)
             && *k == key
         {
@@ -264,7 +275,7 @@ impl MediaPool {
         }
         match self.open_file(path, services) {
             Ok(s) => {
-                let src: SharedSource = Arc::new(ProxySource { proxy: s, info: m.info.clone() });
+                let src: SharedSource = Arc::new(ProxySource { proxy: s, info: m.info.clone(), ranges: m.proxy_ranges.clone(), full });
                 self.proxies.write().unwrap_or_else(|e| e.into_inner()).insert(item, (key, src.clone()));
                 Some(src)
             }
@@ -347,10 +358,14 @@ impl MediaSource for SlateSource {
 
 /// A proxy standing in for its full-resolution media: reports the full-resolution info and hands
 /// out the proxy's (smaller) frames. A proxy whose aspect ratio differs from the original is
-/// resampled to the original's aspect so it lines up exactly.
+/// resampled to the original's aspect so it lines up exactly. A partial proxy (`ranges` not
+/// empty) reads the parts it holds from the proxy and everything else from `full`.
 pub struct ProxySource {
     pub proxy: SharedSource,
     pub info: MediaInfo,
+    pub ranges: Vec<ProxyRange>,
+    /// The full-resolution media (partial proxies).
+    pub full: Option<SharedSource>,
 }
 
 impl MediaSource for ProxySource {
@@ -358,6 +373,28 @@ impl MediaSource for ProxySource {
         &self.info
     }
     fn video_frame(&self, req: FrameRequest) -> filmcraft_media::Result<Arc<VideoFrame>> {
+        if self.ranges.is_empty() {
+            return self.proxy_frame(req);
+        }
+        match ProxyRange::proxy_time(&self.ranges, req.time) {
+            Some(pt) => {
+                let f = self.proxy_frame(FrameRequest { time: pt, scale: req.scale })?;
+                // report media time, like the full-resolution frames
+                Ok(Arc::new((*f).clone().with_pts(f.pts - pt + req.time)))
+            }
+            None => self.full.as_ref().ok_or(MediaError::NoStream("video"))?.video_frame(req),
+        }
+    }
+    fn audio(&self, start: i64, frames: usize, sample_rate: u32) -> filmcraft_media::Result<AudioBuffer> {
+        match &self.full {
+            Some(f) if !self.ranges.is_empty() => f.audio(start, frames, sample_rate),
+            _ => self.proxy.audio(start, frames, sample_rate),
+        }
+    }
+}
+
+impl ProxySource {
+    fn proxy_frame(&self, req: FrameRequest) -> filmcraft_media::Result<Arc<VideoFrame>> {
         let full = self.info.video.as_ref().ok_or(MediaError::NoStream("video"))?;
         let pv = self.proxy.info().video.as_ref().map(|v| (v.width, v.height)).unwrap_or((full.width, full.height));
         // ask the proxy for the scale relative to its own size
@@ -377,9 +414,6 @@ impl MediaSource for ProxySource {
             out[y * w * 4..(y + 1) * w * 4].copy_from_slice(row);
         }
         Ok(Arc::new(VideoFrame::rgba8(w as u32, h as u32, out).with_pts(f.pts)))
-    }
-    fn audio(&self, start: i64, frames: usize, sample_rate: u32) -> filmcraft_media::Result<AudioBuffer> {
-        self.proxy.audio(start, frames, sample_rate)
     }
 }
 

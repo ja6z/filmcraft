@@ -215,6 +215,11 @@ pub struct MediaClip {
     pub offline: bool,
     /// Proxy media, if attached.
     pub proxy: Option<MediaRef>,
+    /// The parts of the media a partial proxy holds (Create Proxies ▸ Only the used parts), in
+    /// media order. Empty: the proxy covers the whole media at the same times. Frames outside
+    /// these parts come from the full-resolution media.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proxy_ranges: Vec<ProxyRange>,
     /// Size and content fingerprint of the file when it was imported (or last linked); relinking
     /// checks a candidate against it. None for generators and projects from older builds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -240,6 +245,22 @@ mod hex_u64 {
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
         let s = String::deserialize(d)?;
         u64::from_str_radix(&s, 16).map_err(serde::de::Error::custom)
+    }
+}
+
+/// One part of a partial proxy: media time `media` is stored in the proxy file from `at`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ProxyRange {
+    pub media: TimeRange,
+    pub at: Tick,
+}
+
+impl ProxyRange {
+    /// The proxy time holding media time `t`, or None when no part covers it.
+    pub fn proxy_time(ranges: &[ProxyRange], t: Tick) -> Option<Tick> {
+        let i = ranges.partition_point(|r| r.media.end() <= t);
+        let r = ranges.get(i)?;
+        (r.media.start <= t).then(|| r.at + (t - r.media.start))
     }
 }
 
@@ -1584,6 +1605,7 @@ mod tests {
                 markers: vec![],
                 offline: false,
                 proxy: None,
+                proxy_ranges: Vec::new(),
                 identity: None,
             }),
             None,

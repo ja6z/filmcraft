@@ -226,3 +226,100 @@ fn render_previews_ignore_proxies() {
     assert!(q > 30.0, "preview rendered from full-resolution media, not the (different) proxy: {q:.1} dB");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn proxy_time_maps_media_time_into_the_parts() {
+    use filmcraft_project::ProxyRange;
+    use filmcraft_time::{Tick, TimeRange};
+    let parts =
+        [ProxyRange { media: TimeRange::new(Tick(100), Tick(50)), at: Tick(0) }, ProxyRange { media: TimeRange::new(Tick(400), Tick(30)), at: Tick(50) }];
+    assert_eq!(ProxyRange::proxy_time(&parts, Tick(99)), None);
+    assert_eq!(ProxyRange::proxy_time(&parts, Tick(100)), Some(Tick(0)));
+    assert_eq!(ProxyRange::proxy_time(&parts, Tick(149)), Some(Tick(49)));
+    assert_eq!(ProxyRange::proxy_time(&parts, Tick(150)), None, "ranges are half-open");
+    assert_eq!(ProxyRange::proxy_time(&parts, Tick(410)), Some(Tick(60)));
+    assert_eq!(ProxyRange::proxy_time(&parts, Tick(430)), None);
+    assert_eq!(ProxyRange::proxy_time(&[], Tick(0)), None);
+}
+
+/// A long recording used in two short pieces: the proxy holds only those pieces (plus handles),
+/// lines up with the original inside them and reads the original outside them.
+#[test]
+fn only_used_parts_proxy_the_used_ranges_and_read_the_rest_from_the_original() {
+    use filmcraft_project::{ProxyRange, TrackKind};
+    use filmcraft_time::{FrameRate, TimeRange};
+    use std::sync::Arc;
+    let root = tmp_dir("proxy-parts");
+    let a = root.join("long.mov");
+    make_movie(&a, DemoScene::Plasma, W, H, 96);
+    let (mut s, items, _) = session_with(&[&a]);
+    let m = items[0];
+    let rate = FrameRate::FPS_24;
+    let f = |n: i64| rate.tick_of(n);
+    // V1 plays source frames 12..24, then 72..78
+    let seq = s.state.active_sequence.unwrap();
+    let mut p = (*s.project).clone();
+    let c1 = p.make_track_item(m, TrackKind::Video, f(0), TimeRange::new(f(12), f(12)), rate).unwrap();
+    let c2 = p.make_track_item(m, TrackKind::Video, f(12), TimeRange::new(f(72), f(6)), rate).unwrap();
+    let q = p.sequence_mut(seq).unwrap();
+    q.video_tracks[0].items = vec![c1, c2];
+    for t in &mut q.audio_tracks {
+        t.items.clear();
+    }
+    s.project = Arc::new(p);
+
+    let parts = crate::proxies::used_parts(&s.project, m, f(6)).unwrap();
+    assert_eq!(
+        parts,
+        vec![ProxyRange { media: TimeRange::from_bounds(f(6), f(30)), at: f(0) }, ProxyRange { media: TimeRange::from_bounds(f(66), f(84)), at: f(24) }],
+        "used frames plus ¼ s handles, back to back"
+    );
+    let full = [(3, frame_rgba(&mut s, 3, 1.0)), (15, frame_rgba(&mut s, 15, 1.0))];
+
+    let r = s.execute("media.createProxies", json!({"items": [m.0], "preset": "prores_proxy_half", "onlyUsed": true, "handles": 0.25, "wait": true})).unwrap();
+    assert_eq!(r["outputs"][0]["parts"], json!(2), "{r}");
+    let clip = s.project.item(m).unwrap().as_media().unwrap().clone();
+    assert!(clip.proxy.is_some(), "attached when the job finished");
+    assert_eq!(clip.proxy_ranges, parts);
+    let job = s.execute("jobs.list", json!({})).unwrap();
+    assert_eq!(job[0]["total"], json!(42), "only the parts are transcoded: {job}");
+
+    s.execute("media.toggleProxies", json!({"enabled": true})).unwrap();
+    for (frame, want) in &full {
+        let px = frame_rgba(&mut s, *frame, 1.0);
+        assert_ne!(px.2, want.2, "frame {frame} comes from the proxy");
+        let q = psnr(&px.2, &want.2);
+        assert!(q > 30.0, "frame {frame}: the proxy part lines up with the original: {q:.1} dB");
+    }
+
+    // a clip moved outside the parts reads the original
+    let mut p = (*s.project).clone();
+    p.sequence_mut(seq).unwrap().video_tracks[0].items[1].source_in = f(40);
+    s.project = Arc::new(p);
+    let with_proxies = frame_rgba(&mut s, 15, 1.0);
+    s.execute("media.toggleProxies", json!({"enabled": false})).unwrap();
+    assert_eq!(with_proxies, frame_rgba(&mut s, 15, 1.0), "outside the parts the original is read");
+
+    // a partial proxy must last as long as its parts
+    let path = clip.proxy.as_ref().map(|r| match r {
+        filmcraft_project::MediaRef::File { path } => path.clone(),
+        _ => String::new(),
+    });
+    let wrong = vec![ProxyRange { media: TimeRange::from_bounds(f(0), f(60)), at: f(0) }];
+    let e = crate::proxies::attach_parts(&mut s, &[(m, path.unwrap(), wrong)], false).unwrap_err().to_string();
+    assert!(e.contains("used parts"), "{e}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn only_used_parts_of_a_mostly_used_clip_proxies_it_whole() {
+    let root = tmp_dir("proxy-parts-whole");
+    let a = root.join("a.mov");
+    make_movie(&a, DemoScene::OceanSunset, W, H, 12);
+    let (mut s, items, _) = session_with(&[&a]);
+    let r = s.execute("media.createProxies", json!({"items": [items[0].0], "preset": "prores_proxy_quarter", "onlyUsed": true, "wait": true})).unwrap();
+    assert_eq!(r["outputs"][0]["parts"], json!(0), "{r}");
+    let m = s.project.item(items[0]).unwrap().as_media().unwrap();
+    assert!(m.proxy.is_some() && m.proxy_ranges.is_empty());
+    let _ = std::fs::remove_dir_all(&root);
+}
