@@ -117,6 +117,47 @@ impl Image {
         out
     }
 
+    /// Area-average resize to `w`×`h` for downscaling by any factor: each destination pixel is
+    /// the coverage-weighted mean of the source pixels under it, so every source pixel counts
+    /// exactly once (no aliasing, means preserved). Requests that don't shrink either axis, or an
+    /// empty source or target, return a copy unchanged.
+    pub fn resized_area(&self, w: usize, h: usize) -> Image {
+        if w == 0 || h == 0 || self.w == 0 || self.h == 0 || (w >= self.w && h >= self.h) || self.px.len() < self.w * self.h * 4 {
+            return self.clone();
+        }
+        let (w, h) = (w.min(self.w), h.min(self.h));
+        // horizontal pass: self.w × self.h → w × self.h
+        let xs = area_taps(self.w, w);
+        let mut tmp = Image::new(w, self.h);
+        tmp.px.par_chunks_mut(w * 4).enumerate().for_each(|(y, row)| {
+            let src = &self.px[y * self.w * 4..(y + 1) * self.w * 4];
+            for (x, taps) in xs.iter().enumerate() {
+                let mut acc = [0.0f32; 4];
+                for &(i, wt) in taps {
+                    if let Some(p) = src.get(i * 4..i * 4 + 4) {
+                        for k in 0..4 {
+                            acc[k] += p[k] * wt;
+                        }
+                    }
+                }
+                row[x * 4..x * 4 + 4].copy_from_slice(&acc);
+            }
+        });
+        // vertical pass: w × self.h → w × h
+        let ys = area_taps(self.h, h);
+        let mut out = Image::new(w, h);
+        out.px.par_chunks_mut(w * 4).zip(ys.par_iter()).for_each(|(row, taps)| {
+            for &(j, wt) in taps {
+                if let Some(src) = tmp.px.get(j * w * 4..(j + 1) * w * 4) {
+                    for (d, s) in row.iter_mut().zip(src) {
+                        *d += s * wt;
+                    }
+                }
+            }
+        });
+        out
+    }
+
     /// Half-size box downsample.
     pub fn downsample2(&self) -> Image {
         let (w, h) = ((self.w / 2).max(1), (self.h / 2).max(1));
@@ -196,5 +237,66 @@ impl Image {
             }
         });
         out
+    }
+}
+
+/// For each of `dst` cells over `src` pixels: the source pixels it covers and their weights
+/// (overlap / cell width), which sum to 1. Used by [`Image::resized_area`].
+fn area_taps(src: usize, dst: usize) -> Vec<Vec<(usize, f32)>> {
+    let dst = dst.max(1);
+    let s = src as f64 / dst as f64;
+    (0..dst)
+        .map(|d| {
+            let (a, b) = (d as f64 * s, (d as f64 + 1.0) * s);
+            let i0 = a.floor() as usize;
+            let i1 = (b.ceil() as usize).min(src);
+            (i0..i1)
+                .filter_map(|i| {
+                    let cover = (b.min(i as f64 + 1.0) - a.max(i as f64)).max(0.0);
+                    (cover > 0.0).then_some((i, (cover / s) as f32))
+                })
+                .collect()
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resized_area_preserves_flat_colour_and_mean() {
+        let img = Image::filled(1920, 1080, [0.25, 0.5, 0.75, 1.0]);
+        let r = img.resized_area(1056, 594);
+        assert_eq!((r.w, r.h), (1056, 594));
+        for p in [r.get(0, 0), r.get(1055, 593), r.get(528, 300)] {
+            for (k, v) in [0.25, 0.5, 0.75, 1.0].into_iter().enumerate() {
+                assert!((p[k] - v).abs() < 1e-5, "{p:?}");
+            }
+        }
+        // a horizontal ramp keeps its mean and stays monotonic (no ringing / skipped pixels)
+        let mut ramp = Image::new(1000, 4);
+        for y in 0..4 {
+            for x in 0..1000 {
+                let v = x as f32 / 999.0;
+                let i = (y * 1000 + x) * 4;
+                ramp.px[i..i + 4].copy_from_slice(&[v, v, v, 1.0]);
+            }
+        }
+        let r = ramp.resized_area(370, 4);
+        let mean = |im: &Image| im.px.chunks(4).map(|p| p[0] as f64).sum::<f64>() / (im.w * im.h) as f64;
+        assert!((mean(&ramp) - mean(&r)).abs() < 1e-4);
+        assert!((0..369).all(|x| r.get(x, 1)[0] <= r.get(x + 1, 1)[0] + 1e-6));
+    }
+
+    #[test]
+    fn resized_area_never_upsizes_or_panics_on_degenerate_input() {
+        let img = Image::filled(10, 10, [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(img.resized_area(20, 20), img);
+        assert_eq!(img.resized_area(0, 5), img);
+        assert_eq!(Image::new(0, 0).resized_area(3, 3), Image::new(0, 0));
+        let r = img.resized_area(1, 1);
+        assert_eq!((r.w, r.h), (1, 1));
+        assert!((r.get(0, 0)[0] - 1.0).abs() < 1e-5);
     }
 }

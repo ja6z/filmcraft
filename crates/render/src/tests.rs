@@ -369,3 +369,50 @@ fn a_multicam_clip_showing_itself_plans_and_renders_to_an_end() {
     let img = render_sequence(&p, a, Tick::ZERO, opts, &sources);
     assert!(img.w > 0 && img.h > 0);
 }
+
+#[test]
+fn exact_downscale_shrinks_only_when_worth_it() {
+    let img = Image::filled(1920, 1080, [0.2, 0.4, 0.6, 1.0]);
+    // 110 % of 4K in 1080p ≈ 0.55 of the width: decimation keeps it whole, the exact step shrinks it
+    let r = exact_downscale(img.clone(), 1056.0);
+    assert_eq!((r.w, r.h), (1056, 594));
+    assert!((r.get(500, 300)[1] - 0.4).abs() < 1e-5);
+    // within 20 % of the wanted width: left alone (not worth a resample)
+    assert_eq!(exact_downscale(img.clone(), 1700.0).w, 1920);
+    // hostile targets never panic and never upsize
+    for t in [f32::NAN, f32::INFINITY, -5.0, 0.0, 0.5, 4000.0] {
+        assert_eq!(exact_downscale(img.clone(), t).w, 1920, "{t}");
+    }
+}
+
+#[test]
+fn reduced_clips_hand_effects_the_wanted_size() {
+    let (mut p, _red, ocean, seq, map) = setup();
+    let id = place(&mut p, seq, 0, ocean, 0, 48);
+    let s = p.sequence(seq).unwrap();
+    let (_, it) = s.find_item(id).unwrap();
+    let src_w = source_size(&p, ocean).unwrap().0 as f32;
+    for want in [0.55f32, 0.3, 0.8] {
+        let layer = base_layer(&p, s, it, Tick(1000), RenderOptions::default(), &map, want).unwrap();
+        let need = (src_w * want).ceil();
+        assert!(
+            layer.w as f32 >= need * (1.0 - 1.0 / 64.0) - 1.0,
+            "never below the wanted size, give or take the 1/64 scale buckets of generator sources: {} < {need}",
+            layer.w
+        );
+        assert!((layer.w as f32) < need * EXACT_DOWNSCALE_MIN, "at most 20 % wider than wanted: {} for {need} ({want})", layer.w);
+    }
+    // a blur on a reduced clip still renders cleanly (no NaN, picture present)
+    let mut p2 = p.clone();
+    {
+        let q = p2.sequence_mut(seq).unwrap();
+        let (_, it) = q.find_item_mut(id).unwrap();
+        it.effect_mut("motion").unwrap().params.get_mut("scale").unwrap().value = ParamValue::Float(55.0);
+        let mut blur = filmcraft_project::find_effect("gaussian_blur").unwrap().instance();
+        blur.params.get_mut("blurriness").unwrap().value = ParamValue::Float(20.0);
+        it.effects.push(blur);
+    }
+    let img = render_sequence(&p2, seq, Tick(1000), RenderOptions::default(), &map);
+    assert!(img.px.iter().all(|v| v.is_finite()));
+    assert!(img.get(160, 90)[3] > 0.99, "centre covered by the 55 % clip");
+}

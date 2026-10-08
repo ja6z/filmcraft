@@ -374,7 +374,7 @@ pub(crate) fn base_layer(
             let frame = src.video_frame(FrameRequest { time: ft, scale: want }).ok()?;
             let n = decimation(frame.width as f32, src_size.0 as f32 * want);
             let img = colorman::decode(project, item.item, &frame, n, &seq.settings.color);
-            match interpolation_blend(item, t, src.info().frame_rate()) {
+            let img = match interpolation_blend(item, t, src.info().frame_rate()) {
                 Some((next_time, wgt)) => match src.video_frame(FrameRequest { time: next_time, scale: want }) {
                     Ok(f2) if f2.width == frame.width && f2.height == frame.height => {
                         let b = colorman::decode(project, item.item, &f2, n, &seq.settings.color);
@@ -383,7 +383,8 @@ pub(crate) fn base_layer(
                     _ => img,
                 },
                 None => img,
-            }
+            };
+            exact_downscale(img, src_size.0 as f32 * want)
         }
         ItemKind::Sequence(nested) => {
             let sub = RenderOptions { scale: want, effects: opts.effects, depth: opts.depth + 1, captions: false, working_output: true };
@@ -453,6 +454,27 @@ pub fn interpolation_blend(item: &TrackItem, t: Tick, src_rate: filmcraft_time::
     }
     // the mix depends only on the media position, so reversed clips blend the same pair
     Some((src_rate.tick_of(f + 1), frac.clamp(0.0, 1.0) as f32))
+}
+
+/// Shrink below this ratio of decoded width to wanted width is not worth a resample.
+const EXACT_DOWNSCALE_MIN: f32 = 1.2;
+
+/// Shrink a decoded picture that the power-of-two [`decimation`] left noticeably wider than
+/// needed (≥ [`EXACT_DOWNSCALE_MIN`] × `target_w`) to the wanted size, so standard effects work on
+/// the pixels that will be shown. Example: a 4K clip at 110 % in a 1080p sequence wants 0.55 of
+/// its width; decimation keeps all of it (halving would undershoot), so its effects processed
+/// 3.3× the pixels needed. Effect parameters follow through `px_scale` (layer width / source
+/// width), as they do for proxies; the area filter keeps every source pixel's weight.
+fn exact_downscale(img: Image, target_w: f32) -> Image {
+    if !(target_w.is_finite() && target_w >= 1.0) || img.w == 0 || img.h == 0 {
+        return img;
+    }
+    let tw = target_w.ceil() as usize;
+    if (img.w as f32) < tw as f32 * EXACT_DOWNSCALE_MIN {
+        return img;
+    }
+    let th = ((img.h as f64 * tw as f64 / img.w as f64).round() as usize).max(1);
+    img.resized_area(tw, th)
 }
 
 /// Largest power-of-two box decimation that keeps at least `target_w` pixels of width.
