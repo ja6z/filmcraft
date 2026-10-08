@@ -14,12 +14,19 @@
 //!   clipped **Curves** and **Photo Filter** adjustment layers are applied to their base layer;
 //! - the merged image.
 //!
-//! Not reproduced (reported in [`Document::warnings`]): layer effects (shadows, glows, strokes),
-//! adjustment layers that are not clipped or of other kinds, and blend modes of clipped layers.
+//! - layer effects: drop shadow, outer glow, inner shadow and inner glow are rendered as images of
+//!   their own ([`Layer::effects`], see [`effects`]), each with its blend mode and opacity.
+//!
+//! Not reproduced (reported in [`Document::warnings`]): other layer effects (stroke, bevel,
+//! overlays, satin), adjustment layers that are not clipped or of other kinds, and blend modes of
+//! clipped layers.
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
 use std::fmt;
+
+pub mod effects;
+pub use effects::{EffectKind, LayerEffect};
 
 /// Photoshop's blend mode keys, in the order of its blend menu (the same order and names as
 /// FilmCraft's Opacity ▸ Blend Mode list). Index 0 is Normal.
@@ -77,8 +84,10 @@ pub struct Layer {
     pub h: u32,
     /// Straight-alpha RGBA, 8 bits, `w × h × 4`, layer mask and clipping applied.
     pub rgba: Vec<u8>,
-    /// Layer opacity × fill opacity × the enclosing groups' opacity, 0..1.
+    /// Layer opacity × fill opacity × the enclosing groups' opacity, 0..1 (for the pixels).
     pub opacity: f32,
+    /// Layer opacity × the enclosing groups' opacity, 0..1 (for the effects: fill doesn't apply).
+    pub layer_opacity: f32,
     /// Index into [`BLEND_KEYS`].
     pub blend: usize,
     /// Shown (false inside a hidden group too).
@@ -92,6 +101,8 @@ pub struct Layer {
     pub has_effects: bool,
     /// Adjustments applied to this layer's pixels (clipped adjustment layers above it).
     pub baked: Vec<String>,
+    /// Its rendered layer effects (shadows and glows).
+    pub effects: Vec<LayerEffect>,
 }
 
 /// A Photoshop document.
@@ -111,7 +122,7 @@ pub struct Document {
 
 // ------------------------------------------------------------------------------------------ bytes
 
-struct Reader<'a> {
+pub(crate) struct Reader<'a> {
     b: &'a [u8],
     p: usize,
 }
@@ -173,6 +184,7 @@ struct Record {
     section: u32,
     kind: LayerKind,
     has_effects: bool,
+    lfx2: Option<Vec<u8>>,
     curves: Option<Vec<u8>>,
     photo_filter: Option<Vec<u8>>,
 }
@@ -216,13 +228,34 @@ pub fn parse(bytes: &[u8]) -> Result<Document> {
         return Err(PsdError::Corrupt(format!("canvas {width}×{height}")));
     }
     r.section("colour mode data")?;
-    r.section("image resources")?;
+    let global_angle = global_light(r.section("image resources")?).unwrap_or(120.0);
     let lm = r.section("layer and mask information")?;
     let mut warnings = Vec::new();
-    let raw = layers_section(lm, depth, gray, &mut warnings)?;
+    let raw = layers_section(lm, depth, gray, global_angle, &mut warnings)?;
     let composite = image_data(&mut r, width, height, channels, depth, gray).ok();
     let layers = bake_clipping(raw, &mut warnings);
     Ok(Document { width, height, depth, layers, composite, warnings })
+}
+
+/// The global light angle (image resource 1037), in degrees.
+fn global_light(b: &[u8]) -> Option<f32> {
+    let mut r = Reader::new(b);
+    while r.left() >= 12 {
+        if r.take(4, "image resources").ok()? != b"8BIM" {
+            return None;
+        }
+        let id = r.u16("image resources").ok()?;
+        let n = r.u8("image resources").ok()? as usize;
+        r.take(n + (n + 1) % 2, "image resources").ok()?;
+        let data = r.section("image resources").ok()?;
+        if data.len() % 2 == 1 {
+            r.take(1.min(r.left()), "image resources").ok()?;
+        }
+        if id == 1037 && data.len() >= 4 {
+            return Some(i32::from_be_bytes([data[0], data[1], data[2], data[3]]) as f32);
+        }
+    }
+    None
 }
 
 fn mode_name(m: u16) -> &'static str {
@@ -242,14 +275,14 @@ fn mode_name(m: u16) -> &'static str {
 /// A layer and, for an adjustment layer, its raw settings.
 type Flat = (Layer, Option<Vec<u8>>);
 
-fn layers_section(b: &[u8], depth: u16, gray: bool, warnings: &mut Vec<String>) -> Result<Vec<Flat>> {
+fn layers_section(b: &[u8], depth: u16, gray: bool, angle: f32, warnings: &mut Vec<String>) -> Result<Vec<Flat>> {
     if b.is_empty() {
         return Ok(Vec::new());
     }
     let mut r = Reader::new(b);
     let info = r.section("layer info")?;
     if !info.is_empty() {
-        return layer_info(info, depth, gray, warnings);
+        return layer_info(info, depth, gray, angle, warnings);
     }
     // global layer mask info, then additional blocks (Lr16 / Lr32)
     if r.left() >= 4 {
@@ -263,7 +296,7 @@ fn layers_section(b: &[u8], depth: u16, gray: bool, warnings: &mut Vec<String>) 
             break;
         }
         match key {
-            b"Lr16" => return layer_info(data, 16, gray, warnings),
+            b"Lr16" => return layer_info(data, 16, gray, angle, warnings),
             b"Lr32" => return Err(PsdError::Unsupported("32 bits per channel layers".into())),
             _ => {}
         }
@@ -271,7 +304,7 @@ fn layers_section(b: &[u8], depth: u16, gray: bool, warnings: &mut Vec<String>) 
     Ok(Vec::new())
 }
 
-fn layer_info(b: &[u8], depth: u16, gray: bool, warnings: &mut Vec<String>) -> Result<Vec<Flat>> {
+fn layer_info(b: &[u8], depth: u16, gray: bool, angle: f32, warnings: &mut Vec<String>) -> Result<Vec<Flat>> {
     let mut r = Reader::new(b);
     let count = r.i16("layer count")?.unsigned_abs() as usize;
     let mut records = Vec::with_capacity(count);
@@ -299,7 +332,7 @@ fn layer_info(b: &[u8], depth: u16, gray: bool, warnings: &mut Vec<String>) -> R
         let rgba = (w > 0 && h > 0).then(|| assemble(&rec, &planes, w, h, gray));
         layers.push((rec, rgba));
     }
-    Ok(flatten(layers, warnings))
+    Ok(flatten(layers, angle, warnings))
 }
 
 fn record(r: &mut Reader) -> Result<Record> {
@@ -354,6 +387,7 @@ fn record(r: &mut Reader) -> Result<Record> {
         section: 0,
         kind: LayerKind::Pixel,
         has_effects: false,
+        lfx2: None,
         curves: None,
         photo_filter: None,
     };
@@ -380,7 +414,11 @@ fn record(r: &mut Reader) -> Result<Record> {
             b"vmsk" | b"vsms" | b"vscg" | b"vstk" => vector = true,
             b"SoCo" | b"GdFl" | b"PtFl" => fill = true,
             b"SoLd" | b"PlLd" | b"SoLE" => rec.kind = LayerKind::SmartObject,
-            b"lfx2" | b"lrFX" | b"lmfx" => rec.has_effects = true,
+            b"lfx2" => {
+                rec.has_effects = true;
+                rec.lfx2 = Some(data.to_vec());
+            }
+            b"lrFX" | b"lmfx" => rec.has_effects = true,
             b"curv" => {
                 rec.kind = LayerKind::Adjustment("Curves".into());
                 rec.curves = Some(data.to_vec());
@@ -531,7 +569,7 @@ fn assemble(rec: &Record, planes: &[(i16, Vec<u8>)], w: usize, h: usize, gray: b
 }
 
 /// Groups flattened into names, visibility and opacity; records become layers (bottom first).
-fn flatten(records: Vec<(Record, Option<Vec<u8>>)>, warnings: &mut Vec<String>) -> Vec<Flat> {
+fn flatten(records: Vec<(Record, Option<Vec<u8>>)>, angle: f32, warnings: &mut Vec<String>) -> Vec<Flat> {
     // records run bottom → top; a group is its end marker (3), its layers, then its folder (1/2)
     struct Group {
         name: String,
@@ -554,12 +592,24 @@ fn flatten(records: Vec<(Record, Option<Vec<u8>>)>, warnings: &mut Vec<String>) 
             _ => {}
         }
         let visible = !rec.hidden && stack.iter().all(|g| g.visible);
-        let opacity = alpha * stack.iter().map(|g| g.opacity).product::<f32>();
+        let groups_opacity = stack.iter().map(|g| g.opacity).product::<f32>();
+        let opacity = alpha * groups_opacity;
         let groups: Vec<String> = stack.iter().map(|g| g.name.clone()).collect();
         let w = (rec.right - rec.left).max(0) as u32;
         let h = (rec.bottom - rec.top).max(0) as u32;
-        if rec.has_effects && visible {
-            warnings.push(format!("“{}”: layer effects (shadows, glows, strokes) are not imported", rec.name));
+        let mut fx = Vec::new();
+        match (&rec.lfx2, &rgba) {
+            (Some(data), Some(px)) => {
+                let (found, other) = effects::read(data, angle);
+                fx = found.iter().filter_map(|s| effects::render(s, px, rec.left, rec.top, w as usize, h as usize)).collect();
+                if visible {
+                    for name in other {
+                        warnings.push(format!("“{}”: {name} layer effect is not imported", rec.name));
+                    }
+                }
+            }
+            (None, _) if rec.has_effects && visible => warnings.push(format!("“{}”: layer effects in the legacy format are not imported", rec.name)),
+            _ => {}
         }
         let settings = rec.curves.or(rec.photo_filter);
         let layer = Layer {
@@ -570,6 +620,7 @@ fn flatten(records: Vec<(Record, Option<Vec<u8>>)>, warnings: &mut Vec<String>) 
             h,
             rgba: rgba.unwrap_or_default(),
             opacity,
+            layer_opacity: rec.opacity as f32 / 255.0 * groups_opacity,
             blend: rec.blend,
             visible,
             kind: rec.kind,
@@ -577,6 +628,7 @@ fn flatten(records: Vec<(Record, Option<Vec<u8>>)>, warnings: &mut Vec<String>) 
             clipped: rec.clipping,
             has_effects: rec.has_effects,
             baked: Vec::new(),
+            effects: fx,
         };
         out.push((layer, settings));
     }

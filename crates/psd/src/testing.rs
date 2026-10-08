@@ -195,3 +195,97 @@ pub fn photo_filter_data(rgb: [u8; 3], density: u32, keep: bool) -> Vec<u8> {
     d.push(keep as u8);
     d
 }
+
+/// A layer effect for [`effects_data`]: `key` is `DrSh`, `OrGl`, `IrSh`, `IrGl` or an effect this
+/// reader doesn't render (`FrFX`…); `blend` a descriptor blend name (`Mltp`, `Scrn`, `Nrml`…).
+pub struct Fx {
+    pub key: &'static str,
+    pub blend: &'static str,
+    pub opacity: f64,
+    pub color: [f64; 3],
+    pub angle: f64,
+    pub global: bool,
+    pub distance: f64,
+    pub spread: f64,
+    pub size: f64,
+}
+
+impl Fx {
+    pub fn new(key: &'static str) -> Self {
+        Fx { key, blend: "Nrml", opacity: 100.0, color: [0.0; 3], angle: 90.0, global: false, distance: 0.0, spread: 0.0, size: 0.0 }
+    }
+}
+
+fn d_id(v: &mut Vec<u8>, s: &str) {
+    if s.len() == 4 {
+        v.extend_from_slice(&0u32.to_be_bytes());
+    } else {
+        v.extend_from_slice(&(s.len() as u32).to_be_bytes());
+    }
+    v.extend_from_slice(s.as_bytes());
+}
+
+fn d_obj(v: &mut Vec<u8>, class: &str, items: &[(&str, Vec<u8>)]) {
+    v.extend_from_slice(&0u32.to_be_bytes()); // empty name
+    d_id(v, class);
+    v.extend_from_slice(&(items.len() as u32).to_be_bytes());
+    for (k, val) in items {
+        d_id(v, k);
+        v.extend_from_slice(val);
+    }
+}
+
+fn d_bool(b: bool) -> Vec<u8> {
+    let mut v = b"bool".to_vec();
+    v.push(b as u8);
+    v
+}
+
+fn d_unit(unit: &str, x: f64) -> Vec<u8> {
+    let mut v = b"UntF".to_vec();
+    v.extend_from_slice(unit.as_bytes());
+    v.extend_from_slice(&x.to_be_bytes());
+    v
+}
+
+fn d_enum(ty: &str, val: &str) -> Vec<u8> {
+    let mut v = b"enum".to_vec();
+    d_id(&mut v, ty);
+    d_id(&mut v, val);
+    v
+}
+
+/// An `lfx2` block (object-based effects descriptor) with `fx`.
+pub fn effects_data(fx: &[Fx]) -> Vec<u8> {
+    let mut v = 0u32.to_be_bytes().to_vec();
+    v.extend_from_slice(&16u32.to_be_bytes());
+    let mut items: Vec<(&str, Vec<u8>)> = vec![("Scl ", d_unit("#Prc", 100.0)), ("masterFXSwitch", d_bool(true))];
+    for f in fx {
+        let mut color = b"Objc".to_vec();
+        let ch = |x: f64| {
+            let mut c = b"doub".to_vec();
+            c.extend_from_slice(&x.to_be_bytes());
+            c
+        };
+        d_obj(&mut color, "RGBC", &[("Rd  ", ch(f.color[0])), ("Grn ", ch(f.color[1])), ("Bl  ", ch(f.color[2]))]);
+        let mut obj = b"Objc".to_vec();
+        d_obj(
+            &mut obj,
+            f.key,
+            &[
+                ("enab", d_bool(true)),
+                ("Md  ", d_enum("BlnM", f.blend)),
+                ("Clr ", color),
+                ("Opct", d_unit("#Prc", f.opacity)),
+                ("uglg", d_bool(f.global)),
+                ("lagl", d_unit("#Ang", f.angle)),
+                ("Dstn", d_unit("#Pxl", f.distance)),
+                ("Ckmt", d_unit("#Pxl", f.spread)),
+                ("blur", d_unit("#Pxl", f.size)),
+            ],
+        );
+        items.push((f.key, obj));
+    }
+    d_obj(&mut v, "null", &items);
+    v
+}

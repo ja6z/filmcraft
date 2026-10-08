@@ -2,7 +2,7 @@
 //! named track per layer, each layer in place with its opacity and blend mode.
 
 use filmcraft_project::{ParamValue, find_effect};
-use filmcraft_psd::testing::{layer, psd};
+use filmcraft_psd::testing::{Fx, effects_data, layer, psd};
 use serde_json::json;
 
 use crate::Session;
@@ -67,6 +67,47 @@ fn a_psd_becomes_a_layered_sequence() {
     std::fs::write(dir.join("fake.psd"), b"not a psd").unwrap();
     let e = s.execute("file.importPsdAsSequence", json!({"path": dir.join("fake.psd").to_string_lossy()})).unwrap_err().to_string();
     assert!(e.contains("not a Photoshop document"), "{e}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Shadows and glows come in as tracks of their own around their layer, with their blend mode and
+/// opacity, and show in the picture.
+#[test]
+fn layer_effects_get_their_own_tracks() {
+    let dir = tmp_dir("psd-effects");
+    let mut title = layer("Título", (10, 10, 20, 10), [255, 255, 255, 255]);
+    title.opacity = 128;
+    title.extra.push((
+        b"lfx2",
+        effects_data(&[
+            Fx { blend: "Mltp", opacity: 50.0, distance: 4.0, ..Fx::new("DrSh") },
+            Fx { blend: "Nrml", size: 3.0, color: [255.0, 0.0, 0.0], ..Fx::new("IrGl") },
+        ]),
+    ));
+    let mut sparks = layer("Chispas", (40, 40, 8, 8), [255, 200, 0, 255]);
+    sparks.extra.push((b"lfx2", effects_data(&[Fx { blend: "Scrn", opacity: 70.0, size: 6.0, color: [255.0, 138.0, 30.0], ..Fx::new("OrGl") }])));
+    let doc = psd(64, 64, &[layer("Fondo", (0, 0, 64, 64), [40, 40, 40, 255]), title, sparks], [40, 40, 40]);
+    let path = dir.join("Fx.psd");
+    std::fs::write(&path, doc).unwrap();
+    let mut s = Session::default();
+    let r = s.execute("file.importPsdAsSequence", json!({"path": path.to_string_lossy(), "destination": dir.join("out").to_string_lossy()})).unwrap();
+    let seq = s.active_sequence().unwrap().clone();
+    let names: Vec<&str> = seq.video_tracks.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(names, ["Fondo", "Título · Drop Shadow", "Título", "Título · Inner Glow", "Chispas · Outer Glow", "Chispas"], "{r}");
+    let param = |track: usize, effect: &str, p: &str| {
+        seq.video_tracks[track].items[0].effects.iter().find(|e| e.effect == effect).and_then(|e| e.params.get(p)).map(|p| p.value.clone())
+    };
+    let mode = |m: &str| ParamValue::Choice(filmcraft_project::effect::BLEND_MODES.iter().position(|x| *x == m).unwrap() as u32);
+    assert_eq!(param(1, "opacity", "blend"), Some(mode("Multiply")));
+    assert_eq!(param(1, "opacity", "opacity"), Some(ParamValue::Float(25.1)), "the effect's 50 % × the layer's 50 %");
+    assert_eq!(param(4, "opacity", "blend"), Some(mode("Screen")));
+    assert_eq!(r["layers"][1]["effects"], json!(["Drop Shadow", "Inner Glow"]));
+    // the picture: the glow lights the background around the sparks, the shadow darkens below the title
+    let (w, _, px) = frame_rgba(&mut s, 0, 1.0);
+    let at = |x: usize, y: usize| px[(y * w + x) * 4..][..3].to_vec();
+    assert!(at(38, 44)[0] > 50, "glow next to the sparks: {:?}", at(38, 44));
+    assert!(at(15, 22)[0] < 40, "shadow under the title: {:?}", at(15, 22));
+    assert_eq!(at(2, 2)[0], at(60, 2)[0], "the background elsewhere");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

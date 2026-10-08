@@ -4,6 +4,7 @@
 use super::*;
 
 use crate::testing::*;
+use crate::{EffectKind, LayerEffect};
 
 fn px(l: &Layer, x: u32, y: u32) -> [u8; 4] {
     let i = ((y * l.w + x) * 4) as usize;
@@ -134,8 +135,9 @@ fn sample_document() {
     let d = parse(&std::fs::read(path).unwrap()).unwrap();
     eprintln!("{}×{} {}-bit, composite {}", d.width, d.height, d.depth, d.composite.is_some());
     for l in &d.layers {
+        let fx: Vec<_> = l.effects.iter().map(|e| (e.kind.label(), BLEND_KEYS[e.blend], e.opacity, e.x, e.y, e.w, e.h)).collect();
         eprintln!(
-            "{:<40} {:?} {:>5},{:>5} {:>5}×{:<5} {:>4.0}% {} {}{}{}",
+            "{:<40} {:?} {:>5},{:>5} {:>5}×{:<5} {:>4.0}% {} {}{}{} fx {:?}",
             l.name,
             l.kind,
             l.x,
@@ -146,10 +148,77 @@ fn sample_document() {
             BLEND_KEYS[l.blend],
             if l.visible { "" } else { "hidden " },
             if l.clipped { "clipped " } else { "" },
-            l.baked.join("+")
+            l.baked.join("+"),
+            fx
         );
     }
     for w in &d.warnings {
         eprintln!("warning: {w}");
     }
+}
+
+fn alpha_at(e: &LayerEffect, x: i32, y: i32) -> u8 {
+    let (ex, ey) = (x - e.x, y - e.y);
+    if ex < 0 || ey < 0 || ex >= e.w as i32 || ey >= e.h as i32 {
+        return 0;
+    }
+    e.rgba[(ey as usize * e.w as usize + ex as usize) * 4 + 3]
+}
+
+fn with_fx(rect: (i32, i32, u32, u32), fx: &[Fx]) -> Layer {
+    let mut l = layer("Fx", rect, [255, 255, 255, 255]);
+    l.extra.push((b"lfx2", effects_data(fx)));
+    let d = parse(&psd(80, 80, &[l], [0, 0, 0])).unwrap();
+    d.layers.into_iter().next().unwrap()
+}
+
+#[test]
+fn drop_shadows_fall_away_from_the_light() {
+    let l = with_fx((10, 10, 20, 10), &[Fx { blend: "Mltp", distance: 4.0, ..Fx::new("DrSh") }]);
+    assert_eq!(l.effects.len(), 1);
+    let e = &l.effects[0];
+    assert_eq!((e.kind, BLEND_KEYS[e.blend], e.opacity), (EffectKind::DropShadow, "mul ", 1.0));
+    assert!(e.kind.behind());
+    // light from 90° (above): the shadow is the layer moved 4 px down
+    assert_eq!(alpha_at(e, 15, 22), 255, "below the layer");
+    assert_eq!(alpha_at(e, 15, 12), 0, "the top rows moved down");
+    assert_eq!(e.rgba[..3], [0, 0, 0]);
+    // the global light (120° unless the document says otherwise): down and to the right
+    let l = with_fx((10, 10, 20, 10), &[Fx { global: true, distance: 10.0, ..Fx::new("DrSh") }]);
+    let e = &l.effects[0];
+    assert_eq!(alpha_at(e, 10 + 5, 10 + 9), 255);
+    assert_eq!(alpha_at(e, 10 + 4, 10 + 8), 0, "the corner moved by (5, 9)");
+}
+
+#[test]
+fn glows_fade_with_distance_and_stay_inside_or_out() {
+    let l = with_fx((20, 20, 30, 30), &[Fx { blend: "Scrn", opacity: 70.0, color: [255.0, 138.0, 30.0], size: 9.0, ..Fx::new("OrGl") }]);
+    let e = &l.effects[0];
+    assert_eq!((e.kind, BLEND_KEYS[e.blend]), (EffectKind::OuterGlow, "scrn"));
+    assert!((e.opacity - 0.7).abs() < 1e-6);
+    assert_eq!(e.rgba[..3], [255, 138, 30]);
+    let (near, mid, far) = (alpha_at(e, 18, 35), alpha_at(e, 15, 35), alpha_at(e, 8, 35));
+    assert!(near > mid && mid > far, "{near} > {mid} > {far}");
+    assert_eq!(far, 0, "beyond the size");
+    // an inner glow lights the edges, not the middle, and nothing outside
+    let l = with_fx((20, 20, 30, 30), &[Fx { size: 6.0, color: [255.0, 255.0, 0.0], ..Fx::new("IrGl") }]);
+    let e = &l.effects[0];
+    assert!(!e.kind.behind());
+    assert_eq!((e.x, e.y, e.w, e.h), (20, 20, 30, 30), "inner effects keep the layer's bounds");
+    assert!(alpha_at(e, 20, 35) > 100, "edge");
+    assert_eq!(alpha_at(e, 35, 35), 0, "middle");
+    // an inner shadow falls inside the top edge for light from above
+    let l = with_fx((20, 20, 30, 30), &[Fx { distance: 5.0, ..Fx::new("IrSh") }]);
+    let e = &l.effects[0];
+    assert_eq!(alpha_at(e, 35, 21), 255, "inside the top edge");
+    assert_eq!(alpha_at(e, 35, 45), 0, "the bottom edge is lit");
+}
+
+#[test]
+fn effects_it_cannot_draw_are_reported() {
+    let mut l = layer("Con borde", (0, 0, 10, 10), [255, 255, 255, 255]);
+    l.extra.push((b"lfx2", effects_data(&[Fx::new("FrFX"), Fx { size: 3.0, ..Fx::new("OrGl") }])));
+    let d = parse(&psd(20, 20, &[l], [0, 0, 0])).unwrap();
+    assert_eq!(d.layers[0].effects.len(), 1, "the glow is drawn");
+    assert!(d.warnings.iter().any(|w| w.contains("Con borde") && w.contains("Stroke")), "{:?}", d.warnings);
 }

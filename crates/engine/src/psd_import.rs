@@ -7,7 +7,12 @@
 //! The layers ([`filmcraft_psd`]) are written as trimmed PNGs to `PSD Layers/<document>/` next to
 //! the project (else in the data directory) and imported into a bin named after the document; the
 //! PSD itself is only read. Clipped Curves / Photo Filter adjustments are baked into their layer;
-//! what can't be reproduced (layer effects, other adjustments) is listed in `warnings`.
+//! what can't be reproduced (some layer effects, other adjustments) is listed in `warnings`.
+//!
+//! Layer effects that [`filmcraft_psd`] renders (drop shadow, outer glow, inner shadow, inner
+//! glow) get tracks of their own named "<layer> · <effect>", with the effect's blend mode and
+//! opacity (× the layer's opacity, not its fill): right under the layer for shadows and outer
+//! glows, right over it for inner effects, so each can be animated or switched off on its own.
 
 use std::path::{Path, PathBuf};
 
@@ -65,32 +70,62 @@ pub fn import(s: &mut Session, p: &Value) -> Result<Value> {
         _ => s.prefs.timeline.still_duration(rate),
     };
 
-    // ---- the layers as files
+    // ---- the layers (and their shadows / glows) as files, bottom first: an effect drawn behind
+    // its layer (drop shadow, outer glow) comes right under it, an inner effect right over it
     let layers: Vec<&filmcraft_psd::Layer> = doc.layers.iter().filter(|l| l.w > 0 && l.h > 0 && !l.rgba.is_empty()).collect();
     if layers.is_empty() {
         return Err(EngineError::Other(format!("{} has no layers with pixels to import", file_name(&path))));
     }
+    let mut elements: Vec<Element> = Vec::new();
+    for l in &layers {
+        let fx = |e: &filmcraft_psd::LayerEffect| Element {
+            name: format!("{} · {}", l.name, e.kind.label()),
+            x: e.x,
+            y: e.y,
+            w: e.w,
+            h: e.h,
+            rgba: e.rgba.clone(),
+            opacity: e.opacity * l.layer_opacity,
+            blend: e.blend,
+            visible: l.visible,
+            effect_of: Some(l.name.clone()),
+        };
+        elements.extend(l.effects.iter().filter(|e| e.kind.behind()).map(fx));
+        elements.push(Element {
+            name: l.name.clone(),
+            x: l.x,
+            y: l.y,
+            w: l.w,
+            h: l.h,
+            rgba: l.rgba.clone(),
+            opacity: l.opacity,
+            blend: l.blend,
+            visible: l.visible,
+            effect_of: None,
+        });
+        elements.extend(l.effects.iter().filter(|e| !e.kind.behind()).map(fx));
+    }
     let dir = layers_dir(s, &stem, str_p(p, "destination"));
     std::fs::create_dir_all(&dir).map_err(|e| EngineError::Other(format!("{}: {e}", dir.display())))?;
-    let mut files = Vec::with_capacity(layers.len());
-    for (i, l) in layers.iter().enumerate() {
-        let png = filmcraft_export::encode_png(l.rgba.clone(), l.w, l.h).map_err(|e| EngineError::Other(format!("“{}”: {e}", l.name)))?;
-        let f = dir.join(format!("{:02} {}.png", i + 1, safe(&l.name)));
+    let mut files = Vec::with_capacity(elements.len());
+    for (i, el) in elements.iter().enumerate() {
+        let png = filmcraft_export::encode_png(el.rgba.clone(), el.w, el.h).map_err(|e| EngineError::Other(format!("“{}”: {e}", el.name)))?;
+        let f = dir.join(format!("{:02} {}.png", i + 1, safe(&el.name)));
         let fs = f.to_string_lossy().into_owned();
         s.services.write_file(&fs, &png).map_err(|e| EngineError::Other(format!("{fs}: {e}")))?;
         files.push(fs);
     }
     let r = s.execute("file.import", json!({"paths": files}))?;
     let items: Vec<ItemId> = r["items"].as_array().map(|a| a.iter().filter_map(Value::as_u64).map(ItemId).collect()).unwrap_or_default();
-    if items.len() != layers.len() {
-        return Err(EngineError::Other(format!("imported {} of {} layer files from {}", items.len(), layers.len(), dir.display())));
+    if items.len() != elements.len() {
+        return Err(EngineError::Other(format!("imported {} of {} layer files from {}", items.len(), elements.len(), dir.display())));
     }
 
-    // ---- the sequence: one track per layer, bottom first
+    // ---- the sequence: one track per layer or effect, bottom first
     let settings = SequenceSettings { width: doc.width, height: doc.height, frame_rate: rate, ..Default::default() };
     let seq_label = s.prefs.labels.defaults.sequence;
     let placed: Vec<(String, i32, i32, u32, u32, f32, usize, bool)> =
-        layers.iter().map(|l| (l.name.clone(), l.x, l.y, l.w, l.h, l.opacity, l.blend, l.visible)).collect();
+        elements.iter().map(|l| (l.name.clone(), l.x, l.y, l.w, l.h, l.opacity, l.blend, l.visible)).collect();
     let n = placed.len();
     let seq = s.edit("Import PSD as Sequence", |pr, st| {
         let bin = pr.add_bin(&format!("{stem} (PSD)"), None);
@@ -133,13 +168,32 @@ pub fn import(s: &mut Session, p: &Value) -> Result<Value> {
         "sequence": seq.0,
         "size": [doc.width, doc.height],
         "folder": dir.to_string_lossy(),
-        "layers": layers.iter().zip(&items).enumerate().map(|(k, (l, i))| json!({
-            "name": l.name, "track": k + 1, "item": i.0, "visible": l.visible, "opacity": l.opacity,
+        "layers": layers.iter().map(|l| json!({
+            "name": l.name, "visible": l.visible, "opacity": l.opacity, "kind": format!("{:?}", l.kind), "baked": l.baked,
             "blend": filmcraft_project::effect::BLEND_MODES.get(l.blend).copied().unwrap_or("Normal"),
-            "kind": format!("{:?}", l.kind), "baked": l.baked,
+            "effects": l.effects.iter().map(|e| e.kind.label()).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+        "tracks": elements.iter().zip(&items).enumerate().map(|(k, (el, i))| json!({
+            "track": k + 1, "name": el.name, "item": i.0, "effectOf": el.effect_of, "opacity": el.opacity,
+            "blend": filmcraft_project::effect::BLEND_MODES.get(el.blend).copied().unwrap_or("Normal"),
         })).collect::<Vec<_>>(),
         "warnings": doc.warnings,
     }))
+}
+
+/// One picture to place: a layer, or one of its effects.
+struct Element {
+    name: String,
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    rgba: Vec<u8>,
+    opacity: f32,
+    blend: usize,
+    visible: bool,
+    /// The layer an effect belongs to (None for the layer itself).
+    effect_of: Option<String>,
 }
 
 fn file_name(path: &str) -> String {
