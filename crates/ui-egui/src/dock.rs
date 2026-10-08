@@ -159,7 +159,8 @@ fn vsplit(size: SplitSize, a: DockNode, b: DockNode) -> DockNode {
     DockNode::Split { vertical: true, size, a: Box::new(a), b: Box::new(b) }
 }
 
-pub const WORKSPACES: [&str; 9] = ["Editing", "Assembly", "Color", "Effects", "Audio", "Captions and Graphics", "Learning", "Review", "All Panels"];
+pub const WORKSPACES: [&str; 10] =
+    ["Editing", "Assembly", "Color", "Effects", "Audio", "Captions and Graphics", "Learning", "Review", "All Panels", "Vertical"];
 
 /// The user's workspaces file, beside `preferences.json` in the data directory.
 pub const WORKSPACES_FILE: &str = "workspaces.json";
@@ -278,6 +279,22 @@ pub fn workspace(name: &str) -> DockNode {
                 hsplit(Ratio(0.3), tabs(&[Project, MediaBrowser, Libraries], 0), bottom_editing()),
             ),
             tabs(&[EssentialGraphics, Properties], 0),
+        ),
+        // For 9:16 work (Reels, TikTok, Shorts): the Program monitor gets a full-height column on
+        // the right, like the player of short-form editors; media + properties over the timeline
+        // on the left.
+        "Vertical" => hsplit(
+            Ratio(0.7),
+            vsplit(
+                Ratio(0.45),
+                hsplit(
+                    Ratio(0.42),
+                    tabs(&[Project, MediaBrowser, Libraries, Effects, Markers, Info, History], 0),
+                    tabs(&[Properties, EffectControls, EssentialGraphics, Text, Source, AudioClipMixer, Metadata], 0),
+                ),
+                bottom_editing(),
+            ),
+            tabs(&[Program], 0),
         ),
         "All Panels" => vsplit(
             Ratio(0.5),
@@ -766,6 +783,20 @@ mod tests {
             assert!(d.contains(PanelKind::Timeline), "{w}");
             assert!(d.contains(PanelKind::Program), "{w}");
         }
+    }
+
+    #[test]
+    fn vertical_workspace_gives_program_a_full_height_right_column() {
+        match workspace("Vertical") {
+            DockNode::Split { vertical: false, a, b, .. } => {
+                assert_eq!(*b, DockNode::Tabs { panels: vec![PanelKind::Program], active: 0 }, "Program alone on the right");
+                assert!(a.contains(PanelKind::Timeline) && a.contains(PanelKind::Project) && a.contains(PanelKind::Properties));
+                assert!(!a.contains(PanelKind::Program));
+            }
+            other => panic!("expected a left | right split, got {other:?}"),
+        }
+        assert!(is_builtin("Vertical"));
+        assert_eq!(find(&WorkspacePrefs::default(), "vertical").as_deref(), Some("Vertical"));
     }
 
     #[test]
