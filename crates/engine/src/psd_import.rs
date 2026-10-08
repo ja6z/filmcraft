@@ -2,7 +2,9 @@
 //! one video track per layer (the bottom layer on V1, tracks named after the layers), each layer a
 //! still clip of the Still Image Default Duration placed where it sits on the canvas (Motion
 //! position, 100 % scale, anchored at the layer's own centre so it scales and rotates in place),
-//! with the layer's opacity and blend mode. Hidden layers come in as disabled clips.
+//! with the layer's opacity and blend mode. Hidden layers come in as disabled clips. The sequence
+//! mixes its layers in display values (Composite in Linear Color off), as Photoshop does, so
+//! semi-transparent layers look as they did in the design.
 //!
 //! The layers ([`filmcraft_psd`]) are written as trimmed PNGs to `PSD Layers/<document>/` next to
 //! the project (else in the data directory) and imported into a bin named after the document; the
@@ -122,7 +124,8 @@ pub fn import(s: &mut Session, p: &Value) -> Result<Value> {
     }
 
     // ---- the sequence: one track per layer or effect, bottom first
-    let settings = SequenceSettings { width: doc.width, height: doc.height, frame_rate: rate, ..Default::default() };
+    // layers mix in display values, as in Photoshop, so the design looks the same
+    let settings = SequenceSettings { width: doc.width, height: doc.height, frame_rate: rate, composite_linear: false, ..Default::default() };
     let seq_label = s.prefs.labels.defaults.sequence;
     let placed: Vec<(String, i32, i32, u32, u32, f32, usize, bool)> =
         elements.iter().map(|l| (l.name.clone(), l.x, l.y, l.w, l.h, l.opacity, l.blend, l.visible)).collect();

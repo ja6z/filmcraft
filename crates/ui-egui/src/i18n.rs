@@ -420,6 +420,8 @@ const SPANISH: &[(&str, &str)] = &[
     ("Sequence", "Secuencia"),
     ("Sequence From Clip", "Secuencia a partir de clip"),
     ("Sequence Settings…", "Ajustes de secuencia…"),
+    ("Composite in Linear Color", "Componer en color lineal"),
+    ("Import PSD as Sequence…", "Importar PSD como secuencia…"),
     ("Sequence…", "Secuencia…"),
     ("Show Active Caption Tracks Only", "Mostrar solo pistas de subtítulos activas"),
     ("Show All Caption Tracks", "Mostrar todas las pistas de subtítulos"),

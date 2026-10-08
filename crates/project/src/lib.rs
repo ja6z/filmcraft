@@ -842,6 +842,21 @@ pub struct SequenceSettings {
     /// Auto Tone Map Media.
     #[serde(default = "default_color_pipeline")]
     pub color: filmcraft_color::ColorPipeline,
+    /// Sequence ▸ Composite in Linear Color: layers mix in linear light (on, physically correct:
+    /// a 50 % white over black is a mid grey of half the light) or, off, in display-encoded
+    /// values as Photoshop and most design tools do (Import PSD as Sequence turns it off so the
+    /// layers look as they did in the design).
+    /// (Written only when off, so existing projects and their render-preview hashes don't change.)
+    #[serde(default = "composite_linear_default", skip_serializing_if = "is_true")]
+    pub composite_linear: bool,
+}
+
+fn composite_linear_default() -> bool {
+    true
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
 }
 
 fn default_color_pipeline() -> filmcraft_color::ColorPipeline {
@@ -864,6 +879,7 @@ impl Default for SequenceSettings {
             max_render_quality: false,
             working_space: "Rec. 709".into(),
             color: filmcraft_color::ColorPipeline::REC709,
+            composite_linear: true,
         }
     }
 }

@@ -31,6 +31,7 @@ fn a_psd_becomes_a_layered_sequence() {
 
     let seq = s.active_sequence().unwrap().clone();
     assert_eq!((seq.settings.width, seq.settings.height), (8, 6));
+    assert!(!seq.settings.composite_linear, "layers mix in display values, as in Photoshop");
     let names: Vec<&str> = seq.video_tracks.iter().map(|t| t.name.as_str()).collect();
     assert_eq!(names, ["Fondo", "TÍTULO", "Oculta"], "bottom layer on V1");
     let clip = &seq.video_tracks[1].items[0];
@@ -67,6 +68,32 @@ fn a_psd_becomes_a_layered_sequence() {
     std::fs::write(dir.join("fake.psd"), b"not a psd").unwrap();
     let e = s.execute("file.importPsdAsSequence", json!({"path": dir.join("fake.psd").to_string_lossy()})).unwrap_err().to_string();
     assert!(e.contains("not a Photoshop document"), "{e}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Sequence ▸ Composite in Linear Color: a 50 % white layer over black is half the light when on,
+/// half the display value (as in Photoshop) when off; the setting is undoable and only written
+/// to the project when off.
+#[test]
+fn composite_in_linear_color_toggles_how_layers_mix() {
+    let dir = tmp_dir("psd-linear");
+    let mut white = layer("Blanco", (0, 0, 4, 4), [255, 255, 255, 255]);
+    white.opacity = 128;
+    std::fs::write(dir.join("Mix.psd"), psd(4, 4, &[layer("Negro", (0, 0, 4, 4), [0, 0, 0, 255]), white], [0, 0, 0])).unwrap();
+    let mut s = Session::default();
+    s.execute("file.importPsdAsSequence", json!({"path": dir.join("Mix.psd").to_string_lossy(), "destination": dir.to_string_lossy()})).unwrap();
+    let display = frame_rgba(&mut s, 0, 1.0).2[0];
+    assert!((display as i32 - 128).abs() <= 2, "half the display value: {display}");
+    let json = serde_json::to_string(&s.active_sequence().unwrap().settings).unwrap();
+    assert!(json.contains("composite_linear"), "written when off");
+    let r = s.execute("sequence.compositeInLinearColor", json!({})).unwrap();
+    assert_eq!(r["enabled"], json!(true));
+    let linear = frame_rgba(&mut s, 0, 1.0).2[0];
+    assert!((linear as i32 - 188).abs() <= 2, "half the light: {linear}");
+    let json = serde_json::to_string(&s.active_sequence().unwrap().settings).unwrap();
+    assert!(!json.contains("composite_linear"), "the default isn't written");
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(!s.active_sequence().unwrap().settings.composite_linear, "undoable");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -363,3 +363,28 @@ fn a_nest_that_is_not_plain_is_still_drawn_right() {
         assert!(w < 0.01, "{what}: plan and reference differ by {w}");
     }
 }
+
+/// A sequence that mixes display values (Composite in Linear Color off, e.g. an imported PSD)
+/// keeps its look when nested in one that mixes in linear light, on both paths.
+#[test]
+fn a_nest_that_mixes_display_values_keeps_its_look() {
+    let mut r = Rig::new();
+    let black = r.matte([0.0, 0.0, 0.0, 1.0], 64, 36);
+    let white = r.matte([1.0, 1.0, 1.0, 1.0], 64, 36);
+    let inner = r.seq("psd", 64, 36, FrameRate::FPS_24);
+    r.p.sequence_mut(inner).unwrap().settings.composite_linear = false;
+    r.put(inner, black, 48);
+    let rate = FrameRate::FPS_24;
+    let mut ti = r.p.make_track_item(white, TrackKind::Video, Tick::ZERO, TimeRange::new(Tick::ZERO, rate.tick_of(48)), rate).unwrap();
+    ti.effect_mut("opacity").unwrap().params.get_mut("opacity").unwrap().value = ParamValue::Float(50.0);
+    r.p.sequence_mut(inner).unwrap().video_tracks[1].items.push(ti);
+    let display = r.frame(inner, Tick(1000)).get(32, 18)[0];
+    assert!((filmcraft_color::linear_to_srgb(display) - 0.5).abs() < 0.01, "half the display value: {display}");
+    let outer = r.seq("edit", 64, 36, FrameRate::FPS_24);
+    r.put(outer, inner, 48);
+    let (cpu, planned) = (r.frame(outer, Tick(1000)), r.planned(outer, Tick(1000)));
+    assert!((cpu.get(32, 18)[0] - display).abs() < 1e-3, "nested: {:?}", cpu.get(32, 18));
+    assert!(worst(&cpu, &planned) < 1e-3, "the plan renders the nest like the CPU does");
+    // and the inner sequence itself plans on the CPU
+    assert!(worst(&r.frame(inner, Tick(1000)), &r.planned(inner, Tick(1000))) < 1e-4);
+}

@@ -272,6 +272,10 @@ file ──► codecs (MP4/MOV, MKV, audio)        demux + decode, GOP-aware see
   and handed to the GPU as an image (a layer image keeps its clip's blend mode), so both paths
   give the same picture. Setting `FILMCRAFT_CPU_COMPOSITE=1`
   forces the CPU path in the desktop app.
+- **Composite in Linear Color.** Layers mix in linear light by default. With Sequence ▸
+  Composite in Linear Color off (`SequenceSettings::composite_linear`; Import PSD as Sequence
+  turns it off) they mix display-encoded values, as Photoshop does (`blend::composite_in`): such a
+  sequence, and a nest of one, is composited on the CPU.
 - **Frame scheduling.** `crates/ui-egui/src/frames.rs` runs a small pool of worker threads with
   prioritised jobs: the frame on screen first, then playback prefetch, then thumbnails. The UI never
   decodes. It shows the exact frame when it is ready and holds the nearest cached frame meanwhile.

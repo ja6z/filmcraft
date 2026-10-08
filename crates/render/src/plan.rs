@@ -106,8 +106,9 @@ fn gpu_chain<'a>(project: &Project, item: &'a TrackItem, opts: RenderOptions) ->
 pub fn plan_frame(project: &Project, seq_id: ItemId, t: Tick, opts: RenderOptions, sources: &dyn SourceProvider) -> FramePlan {
     let Some(seq) = project.sequence(seq_id) else { return FramePlan::Image(crate::Image::new(1, 1)) };
     let (w, h) = output_size(seq, opts.scale);
-    // HDR / wide-gamut sequences composite and convert on the CPU.
-    if !seq.settings.color.is_plain() {
+    // HDR / wide-gamut sequences composite and convert on the CPU, and so do sequences that mix
+    // display-encoded values (Composite in Linear Color off).
+    if !seq.settings.color.is_plain() || !seq.settings.composite_linear {
         return FramePlan::Image(crate::render_sequence(project, seq_id, t, opts, sources));
     }
     // Whole-frame fallback: adjustment layers or complex transitions anywhere at t.
@@ -196,9 +197,10 @@ fn push_tracks(project: &Project, seq: &Sequence, t: Tick, opts: RenderOptions, 
 /// it is in, instead of being rendered to an image on the CPU first. Compositing its layers one
 /// by one over what is below gives the same picture as compositing them together first only when
 /// they all blend Normal, and the frame must be one that plans as layers in the same colour
-/// pipeline.
+/// pipeline, mixing in linear light (a nest that mixes display values is rendered on the CPU).
 fn nest_is_plain(project: &Project, seq: &Sequence, nested: &Sequence, ft: Tick) -> bool {
     nested.settings.color == seq.settings.color
+        && nested.settings.composite_linear
         && (nested.settings.width, nested.settings.height) == (seq.settings.width, seq.settings.height)
         && layered_at(project, nested, ft)
         && nested.video_tracks.iter().filter(|tr| tr.enabled).all(|tr| {

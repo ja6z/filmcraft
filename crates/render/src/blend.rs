@@ -238,8 +238,18 @@ fn hash2(x: usize, y: usize) -> f32 {
     (h >> 40) as f32 / (1u64 << 24) as f32
 }
 
-/// Composite `src` over `dst` (same size) with `opacity` and `mode`.
+/// Composite `src` over `dst` (same size) with `opacity` and `mode`, in linear light.
 pub fn composite(dst: &mut Image, src: &Image, opacity: f32, mode: Blend) {
+    composite_in(dst, src, opacity, mode, true);
+}
+
+/// [`composite`] in linear light (`linear`) or, like Photoshop, on display-encoded values: the
+/// alpha mix and the blend both run on sRGB-encoded straight colour, and the result is converted
+/// back to linear light (Sequence ▸ Composite in Linear Color off).
+pub fn composite_in(dst: &mut Image, src: &Image, opacity: f32, mode: Blend, linear: bool) {
+    if !linear {
+        return composite_encoded(dst, src, opacity, mode);
+    }
     debug_assert_eq!((dst.w, dst.h), (src.w, src.h));
     let w = dst.w;
     dst.px.par_chunks_mut(w * 4).zip(src.px.par_chunks(w * 4)).enumerate().for_each(|(y, (d, s))| {
@@ -277,9 +287,69 @@ pub fn composite(dst: &mut Image, src: &Image, opacity: f32, mode: Blend) {
     });
 }
 
+fn composite_encoded(dst: &mut Image, src: &Image, opacity: f32, mode: Blend) {
+    debug_assert_eq!((dst.w, dst.h), (src.w, src.h));
+    let w = dst.w;
+    dst.px.par_chunks_mut(w * 4).zip(src.px.par_chunks(w * 4)).enumerate().for_each(|(y, (d, s))| {
+        for x in 0..w {
+            let i = x * 4;
+            let mut sa = s[i + 3] * opacity;
+            if sa <= 0.0 {
+                continue;
+            }
+            if mode == Blend::Dissolve {
+                if hash2(x, y) >= sa {
+                    continue;
+                }
+                sa = 1.0;
+            }
+            let sk = s[i + 3].max(1e-12);
+            let cs = [linear_to_srgb(s[i] / sk), linear_to_srgb(s[i + 1] / sk), linear_to_srgb(s[i + 2] / sk)];
+            let da = d[i + 3];
+            let cb = if da > 0.0 { [linear_to_srgb(d[i] / da), linear_to_srgb(d[i + 1] / da), linear_to_srgb(d[i + 2] / da)] } else { [0.0; 3] };
+            let bl = if mode == Blend::Normal || mode == Blend::Dissolve || da <= 0.0 { cs } else { blend_rgb(mode, cb, cs) };
+            let ao = sa + da - sa * da;
+            for c in 0..3 {
+                let enc = (cs[c] * sa * (1.0 - da) + cb[c] * da * (1.0 - sa) + sa * da * bl[c].clamp(0.0, 1.0)) / ao;
+                d[i + c] = srgb_to_linear(enc.clamp(0.0, 1.0)) * ao;
+            }
+            d[i + 3] = ao;
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encoded_compositing_mixes_display_values() {
+        // 50 % white over black: half of the display value (Photoshop), not half of the light
+        let mut lin = Image::filled(1, 1, [0.0, 0.0, 0.0, 1.0]);
+        let mut enc = lin.clone();
+        let s = Image::filled(1, 1, [1.0, 1.0, 1.0, 1.0]);
+        composite_in(&mut lin, &s, 0.5, Blend::Normal, true);
+        composite_in(&mut enc, &s, 0.5, Blend::Normal, false);
+        assert!((lin.get(0, 0)[0] - 0.5).abs() < 1e-4);
+        assert!((linear_to_srgb(enc.get(0, 0)[0]) - 0.5).abs() < 1e-3, "{:?}", enc.get(0, 0));
+        assert_eq!(enc.get(0, 0)[3], 1.0);
+        // opaque layers and other modes agree with the linear path where the maths is the same
+        for m in [Blend::Normal, Blend::Multiply, Blend::Screen] {
+            let mut a = Image::filled(1, 1, [0.2, 0.4, 0.6, 1.0]);
+            let mut b = a.clone();
+            let s = Image::filled(1, 1, [0.5, 0.3, 0.1, 1.0]);
+            composite_in(&mut a, &s, 1.0, m, true);
+            composite_in(&mut b, &s, 1.0, m, false);
+            for k in 0..4 {
+                assert!((a.get(0, 0)[k] - b.get(0, 0)[k]).abs() < 1e-3, "{m:?} {k}: {:?} vs {:?}", a.get(0, 0), b.get(0, 0));
+            }
+        }
+        // over transparency: the source as is
+        let mut t = Image::filled(1, 1, [0.0; 4]);
+        composite_in(&mut t, &Image::filled(1, 1, [0.25, 0.25, 0.25, 0.5]), 1.0, Blend::Normal, false);
+        let p = t.get(0, 0);
+        assert!((p[3] - 0.5).abs() < 1e-5 && (p[0] - 0.25).abs() < 1e-3, "{p:?}");
+    }
 
     #[test]
     fn normal_over() {

@@ -1463,7 +1463,7 @@ fn build() -> Vec<CommandSpec> {
             "Sequence Settings…",
             ["Sequence"],
             None,
-            r#"{"width":u32?,"height":u32?,"fps":f64?,"name":str?,"sampleRate":u32?,"mix":"Stereo|Mono|5.1|Adaptive"?}"#,
+            r#"{"width":u32?,"height":u32?,"fps":f64?,"name":str?,"sampleRate":u32?,"mix":"Stereo|Mono|5.1|Adaptive"?,"compositeLinear":bool?}"#,
             has_seq,
             |s, p| {
                 let id = s.state.active_sequence.ok_or(EngineError::NoSequence)?;
@@ -1495,11 +1495,27 @@ fn build() -> Vec<CommandSpec> {
                     if let Some(m) = mix {
                         q.settings.audio_master = m;
                     }
+                    if let Some(b) = bool_p(&p, "compositeLinear") {
+                        q.settings.composite_linear = b;
+                    }
                     Ok(())
                 })?;
                 Ok(Value::Null)
             }
         ),
+        cmd!("sequence.compositeInLinearColor", "Composite in Linear Color", ["Sequence"], None, r#"{"enabled":bool?}"#, has_seq, |s, p| {
+            // on: layers mix in linear light; off: in display values, as Photoshop does
+            let id = s.state.active_sequence.ok_or(EngineError::NoSequence)?;
+            let cur = s.project.sequence(id).map(|q| q.settings.composite_linear).unwrap_or(true);
+            let on = bool_p(p, "enabled").unwrap_or(!cur);
+            if on != cur {
+                s.edit(if on { "Composite in Linear Color" } else { "Composite in Display Color" }, |pr, _| {
+                    pr.sequence_mut(id).ok_or(EngineError::NoSequence)?.settings.composite_linear = on;
+                    Ok(())
+                })?;
+            }
+            Ok(json!({"enabled": on}))
+        }),
         cmd!("sequence.renderEffectsInToOut", "Render Effects In to Out", ["Sequence"], Some("Enter"), r#"{"wait":bool=false}"#, has_seq, |s, p| {
             crate::previews::render(s, crate::previews::RenderMode::EffectsInToOut, p)
         }),

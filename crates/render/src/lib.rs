@@ -135,7 +135,7 @@ pub(crate) fn render_seq_tracks(project: &Project, seq: &Sequence, t: Tick, opts
             } else {
                 transitions::apply_scaled(&tr.effect, &la, &lb, p, opts.scale)
             };
-            blend::composite(&mut canvas, &mixed, 1.0, Blend::Normal);
+            blend::composite_in(&mut canvas, &mixed, 1.0, Blend::Normal, seq.settings.composite_linear);
             continue;
         }
         let Some(item) = track.item_at(t) else { continue };
@@ -175,12 +175,12 @@ pub(crate) fn render_seq_tracks(project: &Project, seq: &Sequence, t: Tick, opts
                 let cov: Vec<f32> = region.px.as_chunks::<4>().0.iter().map(|p| p[3]).collect();
                 mask::scale_by(&mut adj, &cov);
             }
-            blend::composite(&mut out, &adj, 1.0, bl);
+            blend::composite_in(&mut out, &adj, 1.0, bl, seq.settings.composite_linear);
             canvas = out;
             continue;
         }
         if let Some((layer, op, bl)) = item_layer(project, seq, item, t, opts, sources, &tc) {
-            blend::composite(&mut canvas, &layer, op, bl);
+            blend::composite_in(&mut canvas, &layer, op, bl, seq.settings.composite_linear);
         }
     }
     if opts.depth == 0 && !opts.working_output {

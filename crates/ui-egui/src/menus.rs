@@ -425,6 +425,7 @@ pub fn menu_items(app: &FilmcraftApp) -> Vec<MenuItem> {
             "app.language.english" => it.checked = Some(app.ui.language == crate::i18n::Language::En),
             "app.language.japanese" => it.checked = Some(app.ui.language == crate::i18n::Language::Ja),
             "app.language.spanish" => it.checked = Some(app.ui.language == crate::i18n::Language::Es),
+            "sequence.compositeInLinearColor" => it.checked = app.session.active_sequence().map(|q| q.settings.composite_linear),
             _ => {}
         }
         if it.id.starts_with("view.") {
