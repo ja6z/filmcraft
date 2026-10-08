@@ -31,7 +31,10 @@
 //!   [`effect_cost_ms`]), scaled by sequence pixels / 1080p pixels;
 //! * **transitions**: dissolves/dips 1 ms (GPU), any other transition renders both sides on the
 //!   CPU: 12 ms plus the CPU path of both layers;
-//! * **adjustment layers**: whole-frame CPU render (10 ms) plus their effects.
+//! * **adjustment layers**: whole-frame CPU render (10 ms) plus their effects;
+//! * **graphics**: a graphic clip is drawn as vectors and handed to the compositor as one tight
+//!   image, so its text and shape layers are not standard effects and don't force the CPU path:
+//!   1.5 ms plus [`GRAPHIC_LAYER_MS`] per enabled layer (1080p), scaled by sequence pixels.
 //!
 //! A segment is **red** when the estimate exceeds [`REALTIME_BUDGET`] × the frame duration,
 //! **yellow** when it plays in real time but is not "native", and has **no bar** when it is a single
@@ -58,6 +61,15 @@ pub const HASH_VERSION: &str = "filmcraft-preview-v1";
 ///   the first play right after the render (frame workers still busy with live renders queued
 ///   before it), then 0–1 dropped on every later play.
 pub const REALTIME_BUDGET: f64 = 1.5;
+
+/// Estimated cost of one text or shape layer of a graphic clip on a 1080p frame, in ms.
+///
+/// Measured (M2, release build, headless CPU renderer at 540×960): a graphic clip of 32 animated
+/// layers (26 bars with blurred shadows, three titles, a box) took ≈ 5.5 ms a frame on its own, and
+/// removing it from a 4K HEVC promo saved 4–5 ms a frame: ≈ 0.6 ms per layer at 1080p pixels.
+/// Before, each layer counted as a 20 ms standard effect plus the CPU layer path, so a title
+/// sequence estimated at hundreds of ms and was marked red although it played in real time.
+pub const GRAPHIC_LAYER_MS: f64 = 0.75;
 
 const HD_PIXELS: f64 = 1920.0 * 1080.0;
 
@@ -460,12 +472,19 @@ fn decode_cost_ms(project: &Project, id: ItemId, depth: u32) -> f64 {
     }
 }
 
+/// An enabled standard effect: not intrinsic (Motion, Opacity…) and not a graphic layer (text and
+/// shape layers live in the effect list but are drawn by the graphic renderer).
+fn is_standard_fx(e: &filmcraft_project::EffectInstance) -> bool {
+    e.enabled && !filmcraft_project::graphic::is_layer(e) && e.def().is_some_and(|d| !d.intrinsic)
+}
+
 fn item_fx_cost(it: &TrackItem, px: f64) -> f64 {
-    it.effects.iter().filter(|e| e.enabled && e.def().is_some_and(|d| !d.intrinsic)).map(|e| effect_cost_ms(&e.effect) * px).sum()
+    let layers = it.effects.iter().filter(|e| e.enabled && filmcraft_project::graphic::is_layer(e)).count() as f64;
+    it.effects.iter().filter(|e| is_standard_fx(e)).map(|e| effect_cost_ms(&e.effect) * px).sum::<f64>() + layers * GRAPHIC_LAYER_MS * px
 }
 
 fn cpu_layer(project: &Project, it: &TrackItem) -> bool {
-    let fx = it.effects.iter().any(|e| e.enabled && e.def().is_some_and(|d| !d.intrinsic)) || it.has_opacity_masks();
+    let fx = it.effects.iter().any(is_standard_fx) || it.has_opacity_masks();
     let blend = crate::opacity_blend(it, it.source_in).1 != crate::Blend::Normal;
     let nested = project.item(it.item).is_some_and(|p| matches!(p.kind, ItemKind::Sequence(_)));
     fx || blend || nested

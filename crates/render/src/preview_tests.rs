@@ -210,6 +210,35 @@ fn need_classification_none_yellow_red() {
 }
 
 #[test]
+fn graphic_layers_are_cheap_and_stay_on_the_gpu_path() {
+    use filmcraft_geom::Vec2;
+    use filmcraft_project::graphic::{new_shape_layer, new_text_layer};
+    let (mut p, _matte, ocean, seq) = setup();
+    place(&mut p, seq, 0, ocean, 0, 48);
+    let g = p.add_item("G", Label::Rose, ItemKind::Graphic { width: 1920, height: 1080, rate: FrameRate::FPS_24 }, None);
+    let gc = place(&mut p, seq, 1, g, 0, 48);
+    {
+        let q = p.sequence_mut(seq).unwrap();
+        let (_, it) = q.find_item_mut(gc).unwrap();
+        for i in 0..6 {
+            it.effects.push(new_text_layer("TITLE", Vec2::new(960.0, 200.0 + 120.0 * i as f64), 96.0));
+        }
+        for i in 0..26 {
+            it.effects.push(new_shape_layer(0, Vec2::new(400.0 + 30.0 * i as f64, 900.0), Vec2::new(13.0, 96.0), vec![]));
+        }
+    }
+    let s = video_segments(&p, seq);
+    let seg = segment_at(&s, 10).unwrap();
+    // decode + a 32-layer title (1.5 + 32 × 0.75 ms) stays well inside the realtime budget
+    assert!(seg.cost_ms < 40.0, "a 32-layer title is not 32 standard effects: {} ms", seg.cost_ms);
+    assert_ne!(seg.need, Need::Render, "{} ms", seg.cost_ms);
+    // a real standard effect on the graphic clip still counts in full
+    add_fx(&mut p, seq, gc, "gaussian_blur");
+    let s2 = video_segments(&p, seq);
+    assert!(segment_at(&s2, 10).unwrap().cost_ms >= seg.cost_ms + effect_cost_ms("gaussian_blur"));
+}
+
+#[test]
 fn effect_tiers_are_ordered() {
     assert!(effect_cost_ms("lumetri") > effect_cost_ms("tint"));
     assert!(effect_cost_ms("tint") > effect_cost_ms("crop"));
