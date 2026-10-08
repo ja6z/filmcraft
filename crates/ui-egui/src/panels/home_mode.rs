@@ -170,13 +170,7 @@ fn recent_card(
         painter.text(badge.center(), Align2::CENTER_CENTER, "Open", Tokens::semibold(10.5), Color32::WHITE);
     }
     let text_col = if exists { t.text } else { t.text_dim };
-    let title = painter.layout(name.to_string(), Tokens::semibold(13.0), text_col, CARD_W);
-    let title_row = title.rows.first().map_or(0.0, |r| r.rect().height());
-    painter.with_clip_rect(Rect::from_min_size(pos2(card.min.x, thumb.max.y + 8.0), vec2(CARD_W, title_row + 1.0))).galley(
-        pos2(card.min.x + 2.0, thumb.max.y + 8.0),
-        title,
-        text_col,
-    );
+    painter.galley(pos2(card.min.x + 2.0, thumb.max.y + 8.0), painter.layout_job(title_job(name, text_col)), text_col);
     let when = if !exists {
         "File missing".to_string()
     } else {
@@ -226,6 +220,16 @@ fn recent_card(
         return None;
     }
     Some(Pending::Open(path))
+}
+
+/// A card's title: one line; a long name ends in "…" (the full path is the card's tooltip).
+fn title_job(name: &str, color: Color32) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::simple_singleline(name.to_string(), Tokens::semibold(13.0), color);
+    job.wrap.max_width = CARD_W - 4.0;
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    job.wrap.overflow_character = Some('…');
+    job
 }
 
 /// "Just now", "12 min ago", "Today 14:05", "Yesterday 09:30", else the local date and time.
@@ -327,5 +331,28 @@ fn unsaved_prompt(app: &mut FilmcraftApp, ctx: &egui::Context) {
         }
         "discard" => run(app, ctx, a),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_project_names_end_in_an_ellipsis() {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx, &Tokens::for_kind(crate::theme::ThemeKind::default()));
+        let mut galleys = Vec::new();
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            for name in ["JINGLE-POLITICO_PROMO-SERVICIO_9-16_v4-filmcraft", "Short"] {
+                galleys.push(ui.fonts_mut(|f| f.layout_job(title_job(name, Color32::WHITE))));
+            }
+        });
+        out.textures_delta.clear();
+        let last = |g: &egui::Galley| g.rows.last().and_then(|r| r.glyphs.last()).map(|c| c.chr);
+        assert_eq!(galleys[0].rows.len(), 1, "one line");
+        assert_eq!(last(&galleys[0]), Some('…'));
+        assert!(galleys[0].size().x <= CARD_W - 3.0, "fits the card: {}", galleys[0].size().x);
+        assert_eq!(last(&galleys[1]), Some('t'), "a short name is left alone");
     }
 }
