@@ -312,29 +312,52 @@ pub(crate) fn item_layer(
         let (op, bl) = opacity_blend(item, mt);
         return Some((canvas, op, bl));
     }
-    let mut layer = base_layer(project, seq, item, t, opts, sources, want)?;
-    let px_scale = layer.w as f32 / src_size.0.max(1) as f32;
-    // layer px → source px → sequence px → output px
-    let m = Affine::scale(opts.scale as f64, opts.scale as f64).then_apply(&motion).then_apply(&Affine::scale(1.0 / px_scale as f64, 1.0 / px_scale as f64));
-    // working-picture px → output px (the layer may be cropped to its visible region below)
-    let mut m = m;
+    let src_w = src_size.0.max(1) as f32;
+    // working-picture px → source px → sequence px → output px, for a working picture `px` of the
+    // source's size
+    let to_output =
+        |px: f32| Affine::scale(opts.scale as f64, opts.scale as f64).then_apply(&motion).then_apply(&Affine::scale(1.0 / px as f64, 1.0 / px as f64));
+    let fx = || item.effects.iter().filter(|e| opts.effects && e.def().is_some_and(|d| !d.intrinsic) && !filmcraft_project::graphic::is_layer(e));
+    let probe = |px_scale: f32| effects::FxCtx {
+        t: mt,
+        px_scale,
+        seconds: (t - item.start).seconds(),
+        timecode: tc,
+        clip_name: &item.name,
+        project: Some(project),
+        env: None,
+        working: seq.settings.color.working,
+    };
+    // Visible-region processing (see `roi`): convert only the part of the decoded frame that is
+    // shown (plus the effects' margins) when that is all the effects need.
+    let region = if roi::enabled() && !item.has_opacity_masks() {
+        media_region(project, seq, item, t, sources, want, src_w, |lw, lh| {
+            let px = lw as f32 / src_w;
+            roi::visible_region(lw, lh, &to_output(px), w, h, fx(), &probe(px))
+        })
+    } else {
+        None
+    };
+    let (mut layer, px_scale, mut m, cropped) = match region {
+        Some((img, (ox, oy), lw)) => {
+            let px = lw as f32 / src_w;
+            (img, px, to_output(px).then_apply(&Affine::translate(ox as f64, oy as f64)), true)
+        }
+        None => {
+            let layer = base_layer(project, seq, item, t, opts, sources, want)?;
+            let px = layer.w as f32 / src_w;
+            (layer, px, to_output(px), false)
+        }
+    };
     if opts.effects {
-        let fx = || item.effects.iter().filter(|e| e.def().is_some_and(|d| !d.intrinsic) && !filmcraft_project::graphic::is_layer(e));
-        if roi::enabled() && !item.has_opacity_masks() && fx().next().is_some() {
-            let probe = effects::FxCtx {
-                t: mt,
-                px_scale,
-                seconds: (t - item.start).seconds(),
-                timecode: tc,
-                clip_name: &item.name,
-                project: Some(project),
-                env: None,
-                working: seq.settings.color.working,
-            };
-            if let Some([x0, y0, x1, y1]) = roi::visible_region(layer.w, layer.h, &m, w, h, fx(), &probe) {
-                layer = layer.cropped(x0, y0, x1, y1);
-                m = m.then_apply(&Affine::translate(x0 as f64, y0 as f64));
-            }
+        if !cropped
+            && roi::enabled()
+            && !item.has_opacity_masks()
+            && fx().next().is_some()
+            && let Some([x0, y0, x1, y1]) = roi::visible_region(layer.w, layer.h, &m, w, h, fx(), &probe(px_scale))
+        {
+            layer = layer.cropped(x0, y0, x1, y1);
+            m = m.then_apply(&Affine::translate(x0 as f64, y0 as f64));
         }
         let env = vfx::ItemEnv { project, seq, item, t, opts, sources, want, layer_size: (layer.w, layer.h), layer_to_output: m, tc };
         let cx = effects::FxCtx {
@@ -431,6 +454,46 @@ pub(crate) fn base_layer(
             img
         }
     })
+}
+
+/// A media clip's picture converted only where it is needed: when its working picture is the
+/// decoded frame itself (decimated by a power of two, no exact downscale, no frame blending),
+/// `region(lw, lh)` names the part to keep in working pixels and only that part of the frame's
+/// planes is converted to linear light — the same pixels [`base_layer`] would produce there
+/// ([`VideoFrame::cropped`]), for a fraction of the colour conversion. Returns the crop, its
+/// origin in working pixels and the full working width. None = use [`base_layer`].
+#[allow(clippy::too_many_arguments)]
+fn media_region(
+    project: &Project,
+    seq: &Sequence,
+    item: &TrackItem,
+    t: Tick,
+    sources: &dyn SourceProvider,
+    want: f32,
+    src_w: f32,
+    region: impl FnOnce(usize, usize) -> Option<[usize; 4]>,
+) -> Option<(Image, (usize, usize), usize)> {
+    let pi = project.item(item.item)?;
+    if !matches!(pi.kind, ItemKind::Media(_) | ItemKind::Subclip { .. }) {
+        return None;
+    }
+    let src = sources.source(item.item)?;
+    if interpolation_blend(item, t, src.info().frame_rate()).is_some() {
+        return None;
+    }
+    let frame = src.video_frame(FrameRequest { time: item.source_time_at(t), scale: want }).ok()?;
+    let n = decimation(frame.width as f32, src_w * want);
+    let (lw, lh) = ((frame.width as usize / n).max(1), (frame.height as usize / n).max(1));
+    // `base_layer` would resize this picture exactly: keep its path
+    let tw = (src_w * want).ceil();
+    if tw >= 1.0 && lw as f32 >= tw * EXACT_DOWNSCALE_MIN {
+        return None;
+    }
+    let [x0, y0, x1, y1] = region(lw, lh)?;
+    let px = |v: usize| u32::try_from(v.saturating_mul(n)).unwrap_or(u32::MAX);
+    let (part, fx0, fy0) = frame.cropped(px(x0), px(y0), px(x1), px(y1), n as u32)?;
+    let img = colorman::decode(project, item.item, &part, n, &seq.settings.color);
+    Some((img, (fx0 as usize / n, fy0 as usize / n), lw))
 }
 
 /// The layer of one clip at timeline `t` with its effects applied, on a canvas the size of the

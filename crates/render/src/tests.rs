@@ -442,3 +442,26 @@ fn visible_region_processing_matches_the_whole_picture() {
     assert!(worst < 1e-4, "visible output differs by {worst}");
     assert!(cropped.get(45, 80)[3] > 0.99, "picture present");
 }
+
+#[test]
+fn visible_region_conversion_without_effects_matches_the_whole_picture() {
+    let (mut p, _red, ocean, _seq, map) = setup();
+    let seq = p.new_sequence("v", SequenceSettings { width: 90, height: 160, frame_rate: FrameRate::FPS_24, ..Default::default() }, 1, 1, None);
+    let r = FrameRate::FPS_24;
+    let (_, src_h) = source_size(&p, ocean).unwrap();
+    for (scale, x) in [(160.0 / src_h as f64 * 100.0, 45.0), (160.0 / src_h as f64 * 140.0, 10.0)] {
+        let mut q = p.clone();
+        let mut ti = q.make_track_item(ocean, TrackKind::Video, Tick::ZERO, TimeRange::new(Tick::ZERO, r.tick_of(48)), r).unwrap();
+        let m = ti.effect_mut("motion").unwrap();
+        m.params.get_mut("scale").unwrap().value = ParamValue::Float(scale);
+        m.params.get_mut("position").unwrap().value = ParamValue::Vec2(filmcraft_geom::Vec2::new(x, 80.0));
+        q.sequence_mut(seq).unwrap().video_tracks[0].items.push(ti);
+        let part = render_sequence(&q, seq, Tick(1000), RenderOptions::default(), &map);
+        crate::roi::DISABLED_FOR_TEST.store(true, std::sync::atomic::Ordering::SeqCst);
+        let whole = render_sequence(&q, seq, Tick(1000), RenderOptions::default(), &map);
+        crate::roi::DISABLED_FOR_TEST.store(false, std::sync::atomic::Ordering::SeqCst);
+        let worst = part.px.iter().zip(&whole.px).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(worst < 1e-5, "scale {scale}: visible output differs by {worst}");
+    }
+    let _ = &mut p;
+}

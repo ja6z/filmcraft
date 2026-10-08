@@ -147,6 +147,53 @@ impl VideoFrame {
         Some(VideoFrame { width: ow as u32, height: oh as u32, data, color: self.color, par: self.par, pts: self.pts })
     }
 
+    /// The rectangle `[x0, x1) × [y0, y1)` (clamped to the frame) as its own frame, chroma and
+    /// alpha planes cut at their own resolution. `x0` / `y0` are rounded down to the chroma grid
+    /// (even for 4:2:0) and to `align` (a power of two: pass the decimation factor so `n`×`n` blocks
+    /// stay on the frame's grid); the actual origin is returned with the frame. Chroma is read by
+    /// nearest sample, so converting the crop gives the same pixels as converting the whole frame
+    /// and cutting afterwards, for a fraction of the work. None when nothing is left.
+    pub fn cropped(&self, x0: u32, y0: u32, x1: u32, y1: u32, align: u32) -> Option<(VideoFrame, u32, u32)> {
+        let (w, h) = (self.width, self.height);
+        let (sx, sy) = match &self.data {
+            PixelData::Yuv8 { chroma, .. } | PixelData::Yuv16 { chroma, .. } => chroma.shifts(),
+            PixelData::Rgba8(_) | PixelData::RgbaF32(_) => (0, 0),
+        };
+        let align = align.max(1).next_power_of_two();
+        let (ax, ay) = (align.max(1 << sx), align.max(1 << sy));
+        let (x0, y0) = ((x0.min(w) / ax) * ax, (y0.min(h) / ay) * ay);
+        let (x1, y1) = (x1.min(w), y1.min(h));
+        if x1 <= x0 || y1 <= y0 {
+            return None;
+        }
+        let (fw, fh, cw, ch) = (w as usize, h as usize, (x1 - x0) as usize, (y1 - y0) as usize);
+        let (ox, oy) = (x0 as usize, y0 as usize);
+        let data = match &self.data {
+            PixelData::Rgba8(d) => PixelData::Rgba8(Arc::new(crop_plane(d, fw, fh, 4, ox, oy, cw, ch))),
+            PixelData::RgbaF32(d) => PixelData::RgbaF32(Arc::new(crop_plane(d, fw, fh, 4, ox, oy, cw, ch))),
+            PixelData::Yuv8 { planes, chroma, alpha } => PixelData::Yuv8 {
+                planes: [
+                    Arc::new(crop_plane(&planes[0], fw, fh, 1, ox, oy, cw, ch)),
+                    Arc::new(chroma_crop(&planes[1], fw, fh, sx, sy, ox, oy, cw, ch)),
+                    Arc::new(chroma_crop(&planes[2], fw, fh, sx, sy, ox, oy, cw, ch)),
+                ],
+                chroma: *chroma,
+                alpha: alpha.as_ref().map(|a| Arc::new(crop_plane(a, fw, fh, 1, ox, oy, cw, ch))),
+            },
+            PixelData::Yuv16 { planes, chroma, bits, alpha } => PixelData::Yuv16 {
+                planes: [
+                    Arc::new(crop_plane(&planes[0], fw, fh, 1, ox, oy, cw, ch)),
+                    Arc::new(chroma_crop(&planes[1], fw, fh, sx, sy, ox, oy, cw, ch)),
+                    Arc::new(chroma_crop(&planes[2], fw, fh, sx, sy, ox, oy, cw, ch)),
+                ],
+                chroma: *chroma,
+                bits: *bits,
+                alpha: alpha.as_ref().map(|a| Arc::new(crop_plane(a, fw, fh, 1, ox, oy, cw, ch))),
+            },
+        };
+        Some((VideoFrame { width: cw as u32, height: ch as u32, data, color: self.color, par: self.par, pts: self.pts }, x0, y0))
+    }
+
     /// The frame turned clockwise by `quarter_turns` × 90° (a container's display rotation).
     /// Planes rotate at their own resolution; 4:2:2 chroma is widened to 4:4:4 first for a quarter
     /// or three-quarter turn (its half-width chroma would become half-height, which has no
@@ -460,6 +507,37 @@ pub fn default_matrix(width: u32, height: u32) -> Matrix {
     if width <= 1024 && height <= 576 { Matrix::Bt601 } else { Matrix::Bt709 }
 }
 
+/// `cw`×`ch` samples of a `w`×`h` plane (`comps` values per sample) from (`x0`, `y0`); samples
+/// outside the plane read as zero (callers clamp, so this only guards against bad sizes).
+#[allow(clippy::too_many_arguments)]
+fn crop_plane<T: Copy + Default>(src: &[T], w: usize, h: usize, comps: usize, x0: usize, y0: usize, cw: usize, ch: usize) -> Vec<T> {
+    let mut out = vec![T::default(); cw * ch * comps];
+    if cw == 0 {
+        return out;
+    }
+    for (j, row) in out.chunks_mut(cw * comps).enumerate() {
+        let y = y0 + j;
+        if y >= h || x0 >= w {
+            continue;
+        }
+        let n = cw.min(w - x0) * comps;
+        let s = (y * w + x0) * comps;
+        if let (Some(src_row), Some(dst)) = (src.get(s..s + n), row.get_mut(..n)) {
+            dst.copy_from_slice(src_row);
+        }
+    }
+    out
+}
+
+/// The chroma plane of a `fw`×`fh` frame (shifts `sx`, `sy`) cut to the luma rectangle at
+/// (`ox`, `oy`) of `cw`×`ch` (`ox` / `oy` on the chroma grid).
+#[allow(clippy::too_many_arguments)]
+fn chroma_crop<T: Copy + Default>(p: &[T], fw: usize, fh: usize, sx: u32, sy: u32, ox: usize, oy: usize, cw: usize, ch: usize) -> Vec<T> {
+    let (pw, ph) = (fw.div_ceil(1 << sx), fh.div_ceil(1 << sy));
+    let (cx0, cy0) = (ox >> sx, oy >> sy);
+    crop_plane(p, pw, ph, 1, cx0, cy0, cw.div_ceil(1 << sx).min(pw.saturating_sub(cx0)), ch.div_ceil(1 << sy).min(ph.saturating_sub(cy0)))
+}
+
 /// `n`×`n` box mean of a `w`×`h` plane into `ow`×`oh` (blocks clamped at the right / bottom).
 fn box_plane<T: Copy + Into<u32> + TryFrom<u32> + Send + Sync + Default>(src: &[T], w: usize, h: usize, ow: usize, oh: usize, n: usize) -> Vec<T> {
     let mut out = vec![T::default(); ow * oh];
@@ -592,6 +670,44 @@ mod tests {
         assert!(VideoFrame::rgba8(2, 2, vec![0; 16]).box_decimated(2).is_none());
     }
     use super::*;
+
+    #[test]
+    fn cropped_frames_convert_to_the_same_pixels() {
+        // a 10-bit 4:2:0 frame with gradients in every plane
+        let (w, h) = (64u32, 36u32);
+        let (cw, ch) = (32usize, 18usize);
+        let y: Vec<u16> = (0..w * h).map(|i| (64 + (i * 7) % 876) as u16).collect();
+        let u: Vec<u16> = (0..cw * ch).map(|i| (300 + (i * 11) % 400) as u16).collect();
+        let v: Vec<u16> = (0..cw * ch).map(|i| (350 + (i * 5) % 350) as u16).collect();
+        let f = VideoFrame {
+            width: w,
+            height: h,
+            data: PixelData::Yuv16 { planes: [Arc::new(y), Arc::new(u), Arc::new(v)], chroma: Chroma::C420, bits: 10, alpha: None },
+            color: filmcraft_color::ColorInfo::REC709,
+            par: (1, 1),
+            pts: Tick::ZERO,
+        };
+        for n in [1usize, 2] {
+            let (fw, _, full) = f.to_linear_f32_decimated(n);
+            // odd corners: rounded down to the chroma grid and to n
+            let (c, x0, y0) = f.cropped(13, 7, 45, 29, n as u32).expect("crop");
+            assert!(x0.is_multiple_of(2) && y0.is_multiple_of(2) && (x0 as usize).is_multiple_of(n) && x0 <= 13 && y0 <= 7, "{x0},{y0}");
+            let (pw, ph, part) = c.to_linear_f32_decimated(n);
+            let (dx, dy) = (x0 as usize / n, y0 as usize / n);
+            for yy in 0..ph {
+                for xx in 0..pw {
+                    let a = &full[((dy + yy) * fw + dx + xx) * 4..][..4];
+                    let b = &part[(yy * pw + xx) * 4..][..4];
+                    assert_eq!(a, b, "n={n} at {xx},{yy}");
+                }
+            }
+        }
+        // degenerate rectangles
+        assert!(f.cropped(40, 0, 40, 10, 1).is_none());
+        assert!(f.cropped(100, 0, 200, 10, 1).is_none());
+        let (c, _, _) = f.cropped(0, 0, 1000, 1000, 1).expect("clamped");
+        assert_eq!((c.width, c.height), (w, h));
+    }
 
     #[test]
     fn rgba8_roundtrip_through_linear() {
