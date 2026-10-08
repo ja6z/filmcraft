@@ -175,14 +175,51 @@ pub fn normalize_c(v: u32, bits: u32, range: Range) -> f32 {
     }
 }
 
-/// sRGB electro-optical transfer (encoded → linear).
+/// sRGB electro-optical transfer (encoded → linear), computed exactly (`powf`).
 #[inline]
-pub fn srgb_to_linear(v: f32) -> f32 {
+pub fn srgb_to_linear_exact(v: f32) -> f32 {
     if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
 }
+/// Linear → sRGB-encoded, computed exactly (`powf`).
+#[inline]
+pub fn linear_to_srgb_exact(v: f32) -> f32 {
+    if v <= 0.003_130_8 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 }
+}
+
+/// Segments of the sRGB curve tables over 0…1. Linear interpolation between 65 537 exact points
+/// is within ~1e-7 of the curve everywhere (worst just above the linear toe of the encode side),
+/// hundreds of times finer than a 10-bit code, and replaces a `powf` per channel per pixel:
+/// profiling an export, Lumetri's sRGB round trip alone was ~23 % of the CPU time.
+const SRGB_LUT_SEGMENTS: usize = 1 << 16;
+
+fn srgb_lut(exact: fn(f32) -> f32) -> Box<[f32]> {
+    (0..=SRGB_LUT_SEGMENTS).map(|i| exact(i as f32 / SRGB_LUT_SEGMENTS as f32)).collect()
+}
+
+/// `t` (SRGB_LUT_SEGMENTS + 1 points over 0…1) at `v` in 0…1, linearly interpolated.
+#[inline]
+fn srgb_lut_at(t: &[f32], v: f32) -> f32 {
+    let x = v * SRGB_LUT_SEGMENTS as f32;
+    let i = (x as usize).min(SRGB_LUT_SEGMENTS - 1);
+    let f = x - i as f32;
+    match (t.get(i), t.get(i + 1)) {
+        (Some(a), Some(b)) => a + (b - a) * f,
+        _ => f32::NAN,
+    }
+}
+
+/// sRGB electro-optical transfer (encoded → linear). Table-driven on 0…1 (see
+/// [`SRGB_LUT_SEGMENTS`]); outside it (and for NaN) the exact curve.
+#[inline]
+pub fn srgb_to_linear(v: f32) -> f32 {
+    static T: OnceLock<Box<[f32]>> = OnceLock::new();
+    if (0.0..=1.0).contains(&v) { srgb_lut_at(T.get_or_init(|| srgb_lut(srgb_to_linear_exact)), v) } else { srgb_to_linear_exact(v) }
+}
+/// Linear → sRGB-encoded. Table-driven on 0…1; outside it (and for NaN) the exact curve.
 #[inline]
 pub fn linear_to_srgb(v: f32) -> f32 {
-    if v <= 0.003_130_8 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 }
+    static T: OnceLock<Box<[f32]>> = OnceLock::new();
+    if (0.0..=1.0).contains(&v) { srgb_lut_at(T.get_or_init(|| srgb_lut(linear_to_srgb_exact)), v) } else { linear_to_srgb_exact(v) }
 }
 
 /// Encoded → linear for a transfer function (display-referred; PQ normalised to 100 nits = 1.0).
@@ -232,13 +269,13 @@ pub fn hlg_inverse_oetf(e: f32) -> f32 {
 /// 256-entry table: sRGB-encoded u8 → linear f32.
 pub fn srgb_u8_to_linear_table() -> &'static [f32; 256] {
     static T: OnceLock<[f32; 256]> = OnceLock::new();
-    T.get_or_init(|| std::array::from_fn(|i| srgb_to_linear(i as f32 / 255.0)))
+    T.get_or_init(|| std::array::from_fn(|i| srgb_to_linear_exact(i as f32 / 255.0)))
 }
 
 /// 4096-entry table: linear (0..1, quantised to 12 bits) → sRGB-encoded u8.
 pub fn linear_to_srgb_u8_table() -> &'static [u8; 4096] {
     static T: OnceLock<[u8; 4096]> = OnceLock::new();
-    T.get_or_init(|| std::array::from_fn(|i| (linear_to_srgb(i as f32 / 4095.0) * 255.0 + 0.5).clamp(0.0, 255.0) as u8))
+    T.get_or_init(|| std::array::from_fn(|i| (linear_to_srgb_exact(i as f32 / 4095.0) * 255.0 + 0.5).clamp(0.0, 255.0) as u8))
 }
 
 #[inline]
@@ -317,6 +354,28 @@ pub fn to_hex(c: [f32; 4]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn srgb_tables_match_the_exact_curves() {
+        let (mut dec, mut enc) = (0.0f32, 0.0f32);
+        for i in 0..=1_000_000u32 {
+            let v = i as f32 / 1_000_000.0;
+            dec = dec.max((srgb_to_linear(v) - srgb_to_linear_exact(v)).abs());
+            enc = enc.max((linear_to_srgb(v) - linear_to_srgb_exact(v)).abs());
+        }
+        // a 10-bit code is ~1e-3 wide; f32 steps are ~1.2e-7 near 1, so a few steps is the floor
+        assert!(dec < 5e-7, "decode error {dec}");
+        assert!(enc < 5e-7, "encode error {enc}");
+        // ends, monotonicity on a fine grid, and the exact curve outside 0…1
+        assert_eq!(srgb_to_linear(0.0), 0.0);
+        assert!((srgb_to_linear(1.0) - 1.0).abs() < 1e-7 && (linear_to_srgb(1.0) - 1.0).abs() < 1e-7);
+        assert!((0..10_000).all(|i| linear_to_srgb(i as f32 / 10_000.0) <= linear_to_srgb((i + 1) as f32 / 10_000.0)));
+        for v in [-0.25f32, 1.5, 4.0] {
+            assert_eq!(srgb_to_linear(v), srgb_to_linear_exact(v));
+            assert_eq!(linear_to_srgb(v), linear_to_srgb_exact(v));
+        }
+        assert!(srgb_to_linear(f32::NAN).is_nan() && linear_to_srgb(f32::NAN).is_nan());
+    }
 
     #[test]
     fn ycbcr_roundtrip() {
