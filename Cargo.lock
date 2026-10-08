@@ -1858,6 +1858,7 @@ dependencies = [
  "filmcraft-media",
  "filmcraft-mxf",
  "filmcraft-project",
+ "filmcraft-psd",
  "filmcraft-render",
  "filmcraft-scopes",
  "filmcraft-speech",
@@ -2123,6 +2124,13 @@ dependencies = [
  "filmcraft-testkit",
  "rayon",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "filmcraft-psd"
+version = "0.2.1"
+dependencies = [
+ "miniz_oxide 0.8.9",
 ]
 
 [[package]]

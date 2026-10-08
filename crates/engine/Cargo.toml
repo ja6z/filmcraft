@@ -30,6 +30,7 @@ filmcraft-scopes = { workspace = true }
 filmcraft-text = { workspace = true }
 filmcraft-audio-dsp = { workspace = true }
 filmcraft-export = { workspace = true }
+filmcraft-psd = { workspace = true }
 filmcraft-mxf = { workspace = true }
 filmcraft-format = { workspace = true }
 filmcraft-interchange = { workspace = true }
@@ -42,5 +43,6 @@ log = { workspace = true }
 web-time = "1"
 
 [dev-dependencies]
+filmcraft-psd = { workspace = true, features = ["testing"] }
 filmcraft-testkit = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png"] }

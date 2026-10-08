@@ -116,6 +116,8 @@ fn home_lists_recent_projects_and_opens_them() {
     session.prefs.general.recent_opened.insert(b.clone(), 2_000);
     let mut d = Driver::new(session);
 
+    // File ▸ Import PSD as Sequence… is in the menus
+    assert!(d.ok("ui.menu.list", json!({})).to_string().contains("Import PSD as Sequence"), "File menu lists the PSD import");
     // the house icon opens Home: actions, then the recent projects (Bravo opened last)
     d.ok("ui.click", json!({"id": "header.home"}));
     d.frames(3);

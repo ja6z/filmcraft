@@ -1,0 +1,17 @@
+[package]
+name = "filmcraft-psd"
+description = "Clean-room Adobe Photoshop document (.psd) reader: layers with their pixels, names, bounds, opacity, blend modes, masks and groups, clipped Curves / Photo Filter adjustments baked in, and the merged image"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+miniz_oxide = "0.8"
+
+[features]
+# A minimal PSD writer for other crates' tests.
+testing = []

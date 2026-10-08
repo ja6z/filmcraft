@@ -789,6 +789,17 @@ fn build() -> Vec<CommandSpec> {
                     }
                     continue;
                 }
+                // A Photoshop document comes in as a layered sequence (Import PSD as Sequence).
+                if std::path::Path::new(&path).extension().is_some_and(|e| e.eq_ignore_ascii_case("psd")) {
+                    match crate::psd_import::import(s, &json!({"path": path})) {
+                        Ok(r) => {
+                            sequences.push(r["sequence"].clone());
+                            reports.push(r);
+                        }
+                        Err(e) => errors.push(format!("{path}: {e}")),
+                    }
+                    continue;
+                }
                 // Media files through the host's reader (no whole-file read) when it has one.
                 let streamed = filmcraft_media::is_importable(std::path::Path::new(&path)) && s.services.reader(&path).is_some();
                 let read = if streamed { Ok(Vec::new()) } else { s.services.read_file(&path) };
@@ -2436,6 +2447,7 @@ fn build() -> Vec<CommandSpec> {
     v.extend(crate::relink::commands());
     v.extend(crate::proxies::commands());
     v.extend(crate::recent::commands());
+    v.extend(crate::psd_import::commands());
     v.extend(crate::project_manager::commands());
     v.extend(crate::masks::commands());
     v.extend(crate::presets::commands());

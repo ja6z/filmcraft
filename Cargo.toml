@@ -20,6 +20,7 @@ filmcraft-isobmff = { path = "crates/isobmff" }
 filmcraft-matroska = { path = "crates/matroska" }
 filmcraft-mxf = { path = "crates/mxf" }
 filmcraft-cfb = { path = "crates/cfb" }
+filmcraft-psd = { path = "crates/psd" }
 filmcraft-mpegts = { path = "crates/mpegts" }
 filmcraft-mpeg2v = { path = "crates/mpeg2v" }
 filmcraft-ac3 = { path = "crates/ac3" }

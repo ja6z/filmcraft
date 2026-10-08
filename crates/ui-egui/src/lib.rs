@@ -892,7 +892,7 @@ impl FilmcraftApp {
                     .iter()
                     .chain(filmcraft_media::AUDIO_EXTENSIONS)
                     .chain(filmcraft_media::STILL_EXTENSIONS)
-                    .chain(&["srt", "vtt", "scc", "edl", "xml", "fcpxml", "otio", "aaf", "omf"])
+                    .chain(&["srt", "vtt", "scc", "edl", "xml", "fcpxml", "otio", "aaf", "omf", "psd"])
                     .copied()
                     .collect();
                 let paths = self.hooks.pick_files.as_mut().map(|f| f(&exts)).unwrap_or_default();
@@ -924,6 +924,19 @@ impl FilmcraftApp {
                 let Some(path) = self.hooks.pick_save.as_mut().and_then(|f| f(&suggested)) else { return Ok(Value::Null) };
                 let cmd = if id == "file.saveCopy" { "file.saveCopy" } else { "file.saveAs" };
                 self.session.execute(cmd, json!({"path": path})).map_err(|e| e.to_string())
+            }
+            "file.importPsdAsSequence" => {
+                let paths = self.hooks.pick_files.as_mut().map(|f| f(&["psd"])).unwrap_or_default();
+                let Some(path) = paths.into_iter().next() else { return Ok(Value::Null) };
+                let r = self.session.execute("file.importPsdAsSequence", json!({"path": path})).map_err(|e| e.to_string())?;
+                let n = r["layers"].as_array().map_or(0, Vec::len);
+                let notes = r["warnings"].as_array().map_or(0, Vec::len);
+                self.ui.status = if notes == 0 {
+                    format!("Imported {n} layers as a sequence")
+                } else {
+                    format!("Imported {n} layers as a sequence ({notes} note(s): see the command log)")
+                };
+                Ok(r)
             }
             "file.open" => {
                 let Some(path) = self.hooks.pick_open_project.as_mut().and_then(|f| f()) else { return Ok(Value::Null) };

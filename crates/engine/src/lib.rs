@@ -36,6 +36,7 @@ pub mod project_manager;
 pub mod project_panel;
 pub mod project_tools;
 pub mod proxies;
+pub mod psd_import;
 pub mod recent;
 pub mod relink;
 pub mod remix;
@@ -1035,6 +1036,8 @@ mod project_manager_tests;
 mod project_panel_tests;
 #[cfg(test)]
 mod proxies_tests;
+#[cfg(test)]
+mod psd_import_tests;
 #[cfg(test)]
 mod recent_tests;
 #[cfg(test)]
