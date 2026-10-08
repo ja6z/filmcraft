@@ -144,6 +144,22 @@ fn picture(app: &mut FilmcraftApp, ui: &mut egui::Ui, area: Rect, side: &Value, 
     pic
 }
 
+/// While `resp` is dragged: add this frame's horizontal drag to the total accumulated since the
+/// drag began and return it (points). The drag is read *before* `data_mut`: `data_mut` holds the
+/// context lock and `Response::drag_delta` takes it again (parking_lot's RwLock isn't
+/// re-entrant), so reading it inside froze the app on the first drag in the Trim Monitor.
+fn drag_total(ctx: &egui::Context, resp: &egui::Response) -> Option<f32> {
+    if !resp.dragged() {
+        return None;
+    }
+    let dx = resp.drag_delta().x;
+    Some(ctx.data_mut(|d| {
+        let v = d.get_temp_mut_or_default::<f32>(egui::Id::new("trim-monitor-dx"));
+        *v += dx;
+        *v
+    }))
+}
+
 fn shift_text(frames: i64) -> String {
     if frames > 0 { format!("+{frames}") } else { frames.to_string() }
 }
@@ -220,12 +236,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         if resp.dragged() || resp.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeColumn);
         }
-        if resp.dragged() {
-            let total = ui.ctx().data_mut(|d| {
-                let v = d.get_temp_mut_or_default::<f32>(egui::Id::new("trim-monitor-dx"));
-                *v += resp.drag_delta().x;
-                *v
-            });
+        if let Some(total) = drag_total(ui.ctx(), &resp) {
             let n = (total * fpp).round() as i64;
             ui.painter().text(pos2(r.center().x, r.max.y - 14.0), Align2::CENTER_CENTER, shift_text(n), Tokens::semibold(14.0), col);
         }
@@ -333,5 +344,49 @@ fn drag_trim(app: &mut FilmcraftApp, which: &str, frames: i64) {
     }
     if let Err(e) = app.session.execute("trim.nudge", json!({"frames": frames})) {
         app.ui.status = e.to_string();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Dragging in the Trim Monitor used to deadlock the UI thread (`drag_delta` inside
+    /// `data_mut`). Drive a real drag through egui on a worker thread and fail on a timeout
+    /// instead of hanging the test run.
+    #[test]
+    fn dragging_in_the_trim_monitor_does_not_freeze() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let ctx = egui::Context::default();
+            let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(200.0, 100.0));
+            let press =
+                egui::Event::PointerButton { pos: pos2(50.0, 50.0), button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() };
+            let frames = [
+                // egui hit-tests against the previous frame's widgets: hover first, then press
+                vec![egui::Event::PointerMoved(pos2(50.0, 50.0))],
+                vec![press],
+                vec![egui::Event::PointerMoved(pos2(80.0, 50.0))],
+                vec![egui::Event::PointerMoved(pos2(110.0, 50.0))],
+            ];
+            let mut totals = Vec::new();
+            for (i, events) in frames.into_iter().enumerate() {
+                let input = egui::RawInput {
+                    events,
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 300.0))),
+                    time: Some(i as f64 * 0.1),
+                    ..Default::default()
+                };
+                let _ = ctx.run_ui(input, |ui| {
+                    let resp = ui.interact(area, egui::Id::new("trim-monitor-drag-test"), Sense::drag());
+                    if let Some(t) = drag_total(ui.ctx(), &resp) {
+                        totals.push(t);
+                    }
+                });
+            }
+            let _ = tx.send(totals);
+        });
+        let totals = rx.recv_timeout(std::time::Duration::from_secs(20)).expect("dragging in the Trim Monitor froze the UI thread");
+        assert!(totals.last().is_some_and(|t| *t > 0.0), "the drag accumulates: {totals:?}");
     }
 }
