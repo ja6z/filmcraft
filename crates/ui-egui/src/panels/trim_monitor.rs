@@ -377,12 +377,14 @@ mod tests {
                     time: Some(i as f64 * 0.1),
                     ..Default::default()
                 };
-                let _ = ctx.run_ui(input, |ui| {
+                let mut out = ctx.run_ui(input, |ui| {
                     let resp = ui.interact(area, egui::Id::new("trim-monitor-drag-test"), Sense::drag());
                     if let Some(t) = drag_total(ui.ctx(), &resp) {
                         totals.push(t);
                     }
                 });
+                // no renderer here: drop the font atlas uploads deliberately
+                out.textures_delta.clear();
             }
             let _ = tx.send(totals);
         });
