@@ -411,3 +411,37 @@ fn aac_bitrate_is_capped_for_low_sample_rates() {
         assert!(enc.is_ok(), "{rate} Hz × {ch}: {:?}", enc.err());
     }
 }
+
+#[test]
+fn target_size_sets_the_bitrate_from_the_duration() {
+    let rate = FrameRate::FPS_30;
+    let secs = |s: f64| Tick::from_seconds_f64(s);
+    let mut s = ExportSettings { target_size: Some(TargetSize { megabytes: 25.0, per_minute: true }), ..Default::default() };
+    s.audio.bitrate_kbps = 128;
+    // 25 MB per minute: 3333 kbps in all, 97 % of it for the streams, minus the audio
+    let want = ((25e6_f64 * 8.0 / 60.0 * 0.97 - 128_000.0) / 1000.0).round() as u32;
+    assert_eq!(s.size_bitrate_kbps(1080, 1920, rate, 48_000, secs(60.0)), Some(want));
+    assert_eq!(s.size_bitrate_kbps(1080, 1920, rate, 48_000, secs(30.0)), Some(want), "per minute: the same rate at any length");
+    let est = s.estimate_bytes(1080, 1920, rate, 48_000, secs(30.0)) as f64;
+    assert!((est - 12.5e6 * 0.97).abs() < 12.5e6 * 0.005, "the estimate is the size: {est}");
+    // a size for the whole file
+    s.target_size = Some(TargetSize { megabytes: 25.0, per_minute: false });
+    let whole = ((25e6_f64 * 8.0 / 30.0 * 0.97 - 128_000.0) / 1000.0).round() as u32;
+    assert_eq!(s.size_bitrate_kbps(1080, 1920, rate, 48_000, secs(30.0)), Some(whole));
+    // baked into a plain bitrate for the encoder
+    let baked = s.with_target_size(1080, 1920, rate, 48_000, secs(30.0));
+    assert_eq!((baked.bitrate_kbps, baked.target_size, baked.adaptive_bitrate), (whole, None, None));
+    assert_eq!(baked.resolve(1080, 1920, rate, 48_000).target_kbps, whole);
+    // no video bitrate to set: ProRes, or nothing to export
+    let prores = ExportSettings { format: Format::ProRes, ..s.clone() };
+    assert_eq!(prores.size_bitrate_kbps(1080, 1920, rate, 48_000, secs(30.0)), None);
+    assert_eq!(s.size_bitrate_kbps(1080, 1920, rate, 48_000, Tick::ZERO), None);
+    // settings round-trip, and older settings without the field still load
+    let v = serde_json::to_value(&s).unwrap();
+    assert_eq!(v["targetSize"], serde_json::json!({"megabytes": 25.0, "perMinute": false}));
+    let back: ExportSettings = serde_json::from_value(v).unwrap();
+    assert_eq!(back.target_size, s.target_size);
+    let mut old = serde_json::to_value(ExportSettings::default()).unwrap();
+    old.as_object_mut().unwrap().remove("targetSize");
+    assert_eq!(serde_json::from_value::<ExportSettings>(old).unwrap().target_size, None);
+}

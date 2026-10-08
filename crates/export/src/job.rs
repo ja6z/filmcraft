@@ -112,6 +112,8 @@ impl Exporter {
             _ => ColorSignal::default(),
         };
         // bake the derived bitrate / keyframe values in for the encoder factories
+        let range = export_range(&project, seq, &settings)?;
+        let mut settings = settings.with_target_size(q.settings.width, q.settings.height, q.settings.frame_rate, q.settings.sample_rate, range.duration);
         let r = settings.resolve(q.settings.width, q.settings.height, q.settings.frame_rate, q.settings.sample_rate);
         settings.bitrate_kbps = r.target_kbps;
         settings.max_bitrate_kbps = Some(r.max_kbps);
@@ -119,7 +121,6 @@ impl Exporter {
         settings.adaptive_bitrate = None;
         let two_pass = settings.video_format() == Format::H264 && settings.bitrate_mode == BitrateMode::Vbr2Pass;
         settings.h264_pass = if two_pass { H264Pass::First } else { H264Pass::Single };
-        let range = export_range(&project, seq, &settings)?;
         let pipe = Pipeline::new(project.clone(), seq, &settings, hdr_out)?;
         let (f0, f1) = frame_span(pipe.rate, range);
         let nframes = (f1 - f0) as u64;

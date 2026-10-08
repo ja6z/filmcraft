@@ -239,6 +239,27 @@ fn h264_presets_hit_their_bitrates() {
     }
 }
 
+/// Export ▸ Video ▸ Bitrate From ▸ File size: three seconds of the demo with a 1.5 MB target land
+/// just under it (two-pass closely, one-pass within its usual undershoot).
+#[test]
+fn a_target_file_size_lands_near_the_size() {
+    let mut s = demo();
+    let dir = Scratch::new("target-size");
+    for (mode, low) in [("vbr2Pass", 0.8), ("vbr1Pass", 0.5)] {
+        let path = dir.path(&format!("{mode}.mp4"));
+        s.execute(
+            "file.exportMedia",
+            json!({"preset": "YouTube 1080p Full HD", "settings": {"targetSize": {"megabytes": 1.5, "perMinute": false}, "bitrateMode": mode},
+                   "path": path, "range": "custom", "startSeconds": 0.0, "endSeconds": 3.0, "audio": false, "wait": true}),
+        )
+        .unwrap();
+        let bytes = std::fs::metadata(&path).unwrap().len() as f64;
+        eprintln!("{mode}: {:.2} MB for a 1.5 MB target", bytes / 1e6);
+        assert!(bytes <= 1.5e6 * 1.03, "{mode}: {bytes} bytes is over the 1.5 MB target");
+        assert!(bytes >= 1.5e6 * low, "{mode}: {bytes} bytes is far under the 1.5 MB target");
+    }
+}
+
 #[test]
 fn user_presets_persist_with_favourites_import_and_export() {
     let dir = Scratch::new("library");

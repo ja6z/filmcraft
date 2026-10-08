@@ -190,6 +190,7 @@ pub fn settings_from_params(s: &Session, p: &Value, cmd: &str) -> Result<(Option
     if let Some(v) = u64_p(p, "bitrateKbps") {
         settings.bitrate_kbps = v as u32;
         settings.adaptive_bitrate = None;
+        settings.target_size = None;
     }
     if let Some(v) = u64_p(p, "maxBitrateKbps") {
         settings.max_bitrate_kbps = Some(v as u32);
@@ -800,7 +801,7 @@ fn resolve(s: &mut Session, p: &Value) -> Result<Value> {
     let q = project.sequence(seq).ok_or(EngineError::NoSequence)?;
     let range = filmcraft_export::export_range(&project, seq, &settings).map_err(|e| EngineError::Other(e.to_string()))?;
     let (w, h, rate, sr) = (q.settings.width, q.settings.height, q.settings.frame_rate, q.settings.sample_rate);
-    let r = settings.resolve(w, h, rate, sr);
+    let r = settings.with_target_size(w, h, rate, sr, range.duration).resolve(w, h, rate, sr);
     let (f0, f1) = filmcraft_export::frame_span(r.rate, range);
     let summary = settings.summary(w, h, rate, sr, range.duration);
     Ok(json!({

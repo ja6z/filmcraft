@@ -322,6 +322,25 @@ impl ExportMetadata {
     }
 }
 
+/// Export ▸ Video ▸ File Size: a size for the whole file or per minute of output, in megabytes
+/// (10⁶ bytes, as Finder and phones show sizes).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct TargetSize {
+    pub megabytes: f32,
+    pub per_minute: bool,
+}
+
+impl Default for TargetSize {
+    fn default() -> Self {
+        Self { megabytes: 100.0, per_minute: true }
+    }
+}
+
+/// Share of a target size the streams may fill; the rest covers the container and the rate
+/// control's overshoot.
+const TARGET_SIZE_FILL: f64 = 0.97;
+
 /// Values derived from settings + sequence at export time.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Resolved {
@@ -388,6 +407,45 @@ impl ExportSettings {
         }
     }
 
+    /// The video bitrate (kbps) that makes an export of `duration` land near `target_size`; None
+    /// without a target size or for formats that aren't bitrate-driven.
+    pub fn size_bitrate_kbps(&self, seq_w: u32, seq_h: u32, seq_rate: FrameRate, seq_sr: u32, duration: Tick) -> Option<u32> {
+        let ts = self.target_size?;
+        let secs = duration.seconds();
+        if self.video_format() != Format::H264 || secs <= 0.0 || ts.megabytes.is_nan() || ts.megabytes <= 0.0 {
+            return None;
+        }
+        let bytes = ts.megabytes as f64 * 1e6 * if ts.per_minute { secs / 60.0 } else { 1.0 };
+        let r = self.resolve(seq_w, seq_h, seq_rate, seq_sr);
+        let video_bps = bytes * 8.0 / secs * TARGET_SIZE_FILL - self.audio_bps(&r);
+        Some((video_bps / 1000.0).round().clamp(100.0, 800_000.0) as u32)
+    }
+
+    /// These settings with the target size turned into a fixed bitrate for `duration` (unchanged
+    /// without one).
+    pub fn with_target_size(&self, seq_w: u32, seq_h: u32, seq_rate: FrameRate, seq_sr: u32, duration: Tick) -> ExportSettings {
+        let mut s = self.clone();
+        if let Some(k) = self.size_bitrate_kbps(seq_w, seq_h, seq_rate, seq_sr, duration) {
+            s.bitrate_kbps = k;
+            s.adaptive_bitrate = None;
+            s.max_bitrate_kbps = None;
+        }
+        s.target_size = None;
+        s
+    }
+
+    /// Audio data rate (bits per second) of the output.
+    fn audio_bps(&self, r: &Resolved) -> f64 {
+        if self.has_audio() || matches!(self.format, Format::Wav | Format::Aiff) {
+            match self.audio_codec() {
+                AudioCodec::Aac => self.audio.bitrate_kbps as f64 * 1000.0,
+                _ => r.sample_rate as f64 * r.channels as f64 * if self.audio.bits >= 24 { 24.0 } else { 16.0 },
+            }
+        } else {
+            0.0
+        }
+    }
+
     /// The audio codec actually used.
     pub fn audio_codec(&self) -> AudioCodec {
         match (self.format, self.audio.codec) {
@@ -416,6 +474,9 @@ impl ExportSettings {
 
     /// Estimated output size in bytes for `duration` of a sequence (`seq_w`×`seq_h` at `seq_rate`).
     pub fn estimate_bytes(&self, seq_w: u32, seq_h: u32, seq_rate: FrameRate, seq_sr: u32, duration: Tick) -> u64 {
+        if self.target_size.is_some() {
+            return self.with_target_size(seq_w, seq_h, seq_rate, seq_sr, duration).estimate_bytes(seq_w, seq_h, seq_rate, seq_sr, duration);
+        }
         let r = self.resolve(seq_w, seq_h, seq_rate, seq_sr);
         let secs = duration.seconds().max(0.0);
         let fps = r.rate.num as f64 / r.rate.den as f64;
@@ -448,15 +509,7 @@ impl ExportSettings {
             Format::Gif => px * 0.6 * 8.0 * fps,
             Format::Wav | Format::Aiff | Format::MxfOp1a | Format::MxfOpAtom => 0.0,
         };
-        let audio_bps = if self.has_audio() || matches!(self.format, Format::Wav | Format::Aiff) {
-            match self.audio_codec() {
-                AudioCodec::Aac => self.audio.bitrate_kbps as f64 * 1000.0,
-                _ => r.sample_rate as f64 * r.channels as f64 * if self.audio.bits >= 24 { 24.0 } else { 16.0 },
-            }
-        } else {
-            0.0
-        };
-        ((video_bps + audio_bps) * secs / 8.0).round() as u64
+        ((video_bps + self.audio_bps(&r)) * secs / 8.0).round() as u64
     }
 }
 
@@ -473,6 +526,9 @@ pub struct Summary {
 impl ExportSettings {
     /// Summary lines for a sequence of `seq_w`×`seq_h` at `seq_rate` / `seq_sr` exporting `duration`.
     pub fn summary(&self, seq_w: u32, seq_h: u32, seq_rate: FrameRate, seq_sr: u32, duration: Tick) -> Summary {
+        if self.target_size.is_some() {
+            return self.with_target_size(seq_w, seq_h, seq_rate, seq_sr, duration).summary(seq_w, seq_h, seq_rate, seq_sr, duration);
+        }
         let r = self.resolve(seq_w, seq_h, seq_rate, seq_sr);
         let mbps = |k: u32| format!("{:.2} Mbps", k as f64 / 1000.0);
         let video = if !self.has_video() {

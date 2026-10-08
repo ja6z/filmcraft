@@ -309,3 +309,40 @@ fn export_button_and_quick_export_popup() {
     d.click("quickExport.close");
     assert!(!d.app().ui.export.quick_open);
 }
+
+/// Bitrate From ▸ File size replaces the bitrate fields; "+ Save as Preset…" saves the current
+/// settings as a favourite, which shows as a one-click chip under the preset menu.
+#[test]
+fn file_size_target_save_as_preset_and_favourite_chips() {
+    let mut d = Driver::new("chips");
+    d.ok("ui.set", json!({"mode": "export"}));
+    d.frames(3);
+    d.ok("ui.set", json!({"export": {"settings": {"targetSize": {"megabytes": 25.0, "perMinute": true}}}}));
+    d.frames(3);
+    assert!(d.has("export.video.targetSize"));
+    assert!(d.has("export.video.targetSizePer"));
+    assert!(!d.has("export.video.target"), "no bitrate field while the size decides");
+
+    d.click("export.preset.saveAs");
+    assert!(d.has("export.preset.saveName"), "the name row opens");
+    d.ok("ui.set", json!({"export": {"saveName": "WhatsApp"}}));
+    d.frames(2);
+    d.click("export.preset.saveOk");
+    let lib = &d.app().session.export_presets;
+    let p = lib.find("WhatsApp").expect("saved");
+    assert_eq!(p.settings.target_size.map(|t| (t.megabytes, t.per_minute)), Some((25.0, true)));
+    assert!(lib.is_favorite("WhatsApp"), "saved presets are favourites");
+    assert_eq!(d.app().ui.export.preset, "WhatsApp");
+    assert!(d.app().ui.export.save_name.is_none(), "the name row closes");
+    let chip = format!("export.chip.{}", filmcraft_engine::export::presets::preset_key("WhatsApp"));
+    assert!(d.has(&chip), "{chip}");
+    d.snapshot("export-chips");
+
+    // a chip applies its preset in one click
+    d.ok("ui.set", json!({"export": {"settings": {"bitrateKbps": 9000, "targetSize": null}, "preset": "Custom"}}));
+    d.frames(2);
+    assert_eq!(d.app().ui.export.settings.target_size, None);
+    d.click(&chip);
+    assert_eq!(d.app().ui.export.preset, "WhatsApp");
+    assert_eq!(d.app().ui.export.settings.target_size.map(|t| t.megabytes), Some(25.0));
+}

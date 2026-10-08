@@ -57,6 +57,8 @@ pub struct ExportUi {
     pub quick_open: bool,
     pub quick_path: String,
     pub quick_preset: String,
+    /// Save as Preset row under the preset chips (None = closed): the name being typed.
+    pub save_name: Option<String>,
 }
 
 impl Default for ExportUi {
@@ -76,6 +78,7 @@ impl Default for ExportUi {
             quick_open: false,
             quick_path: String::new(),
             quick_preset: String::new(),
+            save_name: None,
         }
     }
 }
@@ -383,8 +386,16 @@ fn settings_column(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         .map(|q| (q.settings.width, q.settings.height, q.settings.frame_rate, q.settings.sample_rate))
         .unwrap_or((1920, 1080, FrameRate::FPS_24, 48_000));
     let has_captions = app.session.active_sequence().is_some_and(|q| !q.caption_tracks.is_empty());
+    let duration = app.session.active_sequence().map_or(Tick::ZERO, |q| {
+        let (a, b) = range_ticks(&app.ui.export, q);
+        b - a
+    });
     let all_presets = app.session.export_presets.all();
-    let favs: Vec<String> = all_presets.iter().filter(|p| app.session.export_presets.is_favorite(&p.name)).map(|p| p.name.clone()).collect();
+    let favs: Vec<(String, bool)> =
+        all_presets.iter().filter(|p| app.session.export_presets.is_favorite(&p.name)).map(|p| (p.name.clone(), p.builtin)).collect();
+    let mut save_preset: Option<String> = None;
+    let mut unfavorite: Option<String> = None;
+    let mut delete_preset: Option<String> = None;
     let mut pick_folder = false;
     let mut pick_overlay = false;
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(vec2(14.0, 10.0))).id_salt("export-settings"));
@@ -404,7 +415,7 @@ fn settings_column(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
             let r = egui::ComboBox::from_id_salt("export.preset").selected_text(&ex.preset).width(ui.available_width() - 4.0).show_ui(ui, |ui| {
                 if !favs.is_empty() {
                     ui.label(egui::RichText::new("Favorites").color(t.text_dim).size(11.0));
-                    for f in &favs {
+                    for (f, _) in &favs {
                         if ui.selectable_label(*f == ex.preset, f).clicked() {
                             chosen_preset = Some(f.clone());
                         }
@@ -436,6 +447,52 @@ fn settings_column(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 open_manager = true;
             }
         });
+        // Favourite presets one click away, and saving the current settings as one.
+        ui.horizontal_wrapped(|ui| {
+            ui.add_space(LABEL_W + 8.0);
+            for (f, builtin) in &favs {
+                let r = ui.selectable_label(*f == ex.preset, egui::RichText::new(format!("★ {f}")).size(12.0));
+                reg.add(format!("export.chip.{}", filmcraft_engine::export::presets::preset_key(f)), r.rect, f.clone());
+                if r.clicked() {
+                    chosen_preset = Some(f.clone());
+                }
+                r.context_menu(|ui| {
+                    if ui.button("Remove from Favorites").clicked() {
+                        unfavorite = Some(f.clone());
+                        ui.close();
+                    }
+                    if !builtin && ui.button("Delete Preset").clicked() {
+                        delete_preset = Some(f.clone());
+                        ui.close();
+                    }
+                });
+            }
+            let r = ui.button(egui::RichText::new("+ Save as Preset…").size(12.0)).on_hover_text("Save the current settings as a favourite preset");
+            reg.add("export.preset.saveAs", r.rect, "Save as Preset…");
+            if r.clicked() {
+                ex.save_name = Some(if ex.preset == CUSTOM { String::new() } else { ex.preset.clone() });
+            }
+        });
+        if let Some(name) = ex.save_name.as_mut() {
+            let mut close = false;
+            row(ui, &t, "Preset Name", |ui| {
+                let r = ui.add(egui::TextEdit::singleline(name).hint_text("e.g. WhatsApp").desired_width(200.0));
+                reg.add("export.preset.saveName", r.rect, "Preset name");
+                let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let r = ui.add_enabled(!name.trim().is_empty(), egui::Button::new("Save"));
+                reg.add("export.preset.saveOk", r.rect, "Save");
+                if (r.clicked() || enter) && !name.trim().is_empty() {
+                    save_preset = Some(name.trim().to_string());
+                    close = true;
+                }
+                let r = ui.button("Cancel");
+                reg.add("export.preset.saveCancel", r.rect, "Cancel");
+                close |= r.clicked();
+            });
+            if close {
+                ex.save_name = None;
+            }
+        }
         row(ui, &t, "Format", |ui| {
             let labels: Vec<(String, bool)> = Format::ALL.iter().map(|f| (f.label().to_string(), filmcraft_engine::export::available(*f))).collect();
             if let Some(i) = combo(ui, &mut reg, "export.format", ex.settings.format.label(), &labels, ui.available_width() - 4.0) {
@@ -457,7 +514,7 @@ fn settings_column(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         ui.add_space(8.0);
         let s = &mut ex.settings;
         if s.has_video() && section(ui, &mut reg, &mut ex.open_sections, "video", "Video", &t) {
-            video_section(ui, &mut reg, s, &t, seq_w, seq_h);
+            video_section(ui, &mut reg, s, &t, (seq_w, seq_h, seq_rate, seq_sr), duration);
         }
         if (s.has_audio()
             || !s.has_video()
@@ -526,6 +583,30 @@ fn settings_column(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     if let Some(name) = chosen_preset {
         apply_preset(app, &name);
     }
+    if let Some(name) = save_preset {
+        let saved = app
+            .session
+            .execute("export.presets.save", json!({"name": name, "settings": settings_json(&app.ui.export.settings)}))
+            .and_then(|_| app.session.execute("export.presets.favorite", json!({"name": name, "favorite": true})));
+        match saved {
+            Ok(_) => {
+                app.ui.export.preset = name.clone();
+                app.ui.status = format!("Saved export preset “{name}”");
+            }
+            Err(e) => app.ui.status = e.to_string(),
+        }
+    }
+    if let Some(name) = unfavorite
+        && let Err(e) = app.session.execute("export.presets.favorite", json!({"name": name, "favorite": false}))
+    {
+        app.ui.status = e.to_string();
+    }
+    if let Some(name) = delete_preset {
+        match app.session.execute("export.presets.delete", json!({"name": name})) {
+            Ok(_) => app.ui.status = format!("Deleted export preset “{name}”"),
+            Err(e) => app.ui.status = e.to_string(),
+        }
+    }
     if open_manager {
         app.ui.export.manager = Some(PresetManager { selected: app.ui.export.preset.clone(), ..Default::default() });
     }
@@ -539,7 +620,9 @@ fn settings_column(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     reg.flush(app);
 }
 
-fn video_section(ui: &mut egui::Ui, reg: &mut Reg, s: &mut ExportSettings, t: &Tokens, seq_w: u32, seq_h: u32) {
+/// `seq`: the sequence's (width, height, rate, sample rate); `duration`: the export range.
+fn video_section(ui: &mut egui::Ui, reg: &mut Reg, s: &mut ExportSettings, t: &Tokens, seq: (u32, u32, FrameRate, u32), duration: Tick) {
+    let (seq_w, seq_h, seq_rate, seq_sr) = seq;
     // frame size
     let mut match_size = s.frame_size.is_none();
     row(ui, t, "Frame Size", |ui| {
@@ -617,7 +700,35 @@ fn video_section(ui: &mut egui::Ui, reg: &mut Reg, s: &mut ExportSettings, t: &T
                     s.bitrate_mode = o[i];
                 }
             });
-            if let Some(bpp) = s.adaptive_bitrate {
+            row(ui, t, "Bitrate From", |ui| {
+                let cur = if s.target_size.is_some() { "File size" } else { "Bitrate" };
+                if let Some(i) = combo(ui, reg, "export.video.sizeMode", cur, &opts(&["Bitrate", "File size"]), 140.0) {
+                    s.target_size = if i == 1 { Some(s.target_size.unwrap_or_default()) } else { None };
+                }
+            });
+            if let Some(ts) = s.target_size.as_mut() {
+                row(ui, t, "File Size", |ui| {
+                    let mut mb = ts.megabytes as f64;
+                    if drag(ui, reg, "export.video.targetSize", &mut mb, 1.0..=100_000.0, 1.0, " MB", 0) {
+                        ts.megabytes = mb as f32;
+                    }
+                    let cur = if ts.per_minute { "per minute" } else { "for the whole file" };
+                    if let Some(i) = combo(ui, reg, "export.video.targetSizePer", cur, &opts(&["per minute", "for the whole file"]), 150.0) {
+                        ts.per_minute = i == 0;
+                    }
+                });
+                let hint = match s.size_bitrate_kbps(seq_w, seq_h, seq_rate, seq_sr, duration) {
+                    Some(k) => {
+                        let mut h = format!("≈ {:.1} Mbps video for this {:.0} s export", k as f64 / 1000.0, duration.seconds());
+                        if s.bitrate_mode != BitrateMode::Vbr2Pass {
+                            h.push_str(" · VBR 2 pass lands closer to the size (takes twice as long)");
+                        }
+                        h
+                    }
+                    None => "Set a range to export".to_string(),
+                };
+                row(ui, t, "", |ui| ui.label(egui::RichText::new(hint).color(t.text_dim).size(11.5)));
+            } else if let Some(bpp) = s.adaptive_bitrate {
                 row(ui, t, "Target Bitrate", |ui| {
                     ui.label(egui::RichText::new(format!("Adaptive ({bpp} bits per pixel)")).size(12.0));
                     let r = ui.small_button("Set");

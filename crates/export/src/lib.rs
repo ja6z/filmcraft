@@ -253,6 +253,10 @@ pub struct ExportSettings {
     /// Adaptive bitrate (the Match Source presets): bits per pixel per frame; replaces
     /// `bitrate_kbps` with `width × height × fps × bpp / 1000`.
     pub adaptive_bitrate: Option<f32>,
+    /// File size target (H.264): the video bitrate is worked out at export from the range's
+    /// duration so the file lands near this size; replaces `bitrate_kbps` / `adaptive_bitrate`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_size: Option<TargetSize>,
     /// Frames between keyframes (None = 2 seconds).
     pub keyframe_distance: Option<u32>,
     /// Render at Maximum Depth. FilmCraft always composites in 32-bit float, so this changes
@@ -431,6 +435,7 @@ impl Default for ExportSettings {
             bitrate_mode: BitrateMode::default(),
             max_bitrate_kbps: None,
             adaptive_bitrate: None,
+            target_size: None,
             keyframe_distance: None,
             render_at_max_depth: false,
             max_render_quality: false,
