@@ -117,6 +117,24 @@ impl Image {
         out
     }
 
+    /// The rectangle `[x0, x1) × [y0, y1)` (clamped to the image) as a new image.
+    pub fn cropped(&self, x0: usize, y0: usize, x1: usize, y1: usize) -> Image {
+        let (x1, y1) = (x1.min(self.w), y1.min(self.h));
+        let (x0, y0) = (x0.min(x1), y0.min(y1));
+        let (w, h) = (x1 - x0, y1 - y0);
+        let mut out = Image::new(w, h);
+        if w == 0 || h == 0 {
+            return out;
+        }
+        out.px.par_chunks_mut(w * 4).enumerate().for_each(|(j, row)| {
+            let s = ((y0 + j) * self.w + x0) * 4;
+            if let Some(src) = self.px.get(s..s + w * 4) {
+                row.copy_from_slice(src);
+            }
+        });
+        out
+    }
+
     /// Area-average resize to `w`×`h` for downscaling by any factor: each destination pixel is
     /// the coverage-weighted mean of the source pixels under it, so every source pixel counts
     /// exactly once (no aliasing, means preserved). Requests that don't shrink either axis, or an

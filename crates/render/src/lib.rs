@@ -28,6 +28,7 @@ pub mod offline;
 pub mod plan;
 pub mod preview;
 pub mod remix;
+pub(crate) mod roi;
 pub mod scene;
 pub mod track;
 pub mod transitions;
@@ -315,7 +316,26 @@ pub(crate) fn item_layer(
     let px_scale = layer.w as f32 / src_size.0.max(1) as f32;
     // layer px → source px → sequence px → output px
     let m = Affine::scale(opts.scale as f64, opts.scale as f64).then_apply(&motion).then_apply(&Affine::scale(1.0 / px_scale as f64, 1.0 / px_scale as f64));
+    // working-picture px → output px (the layer may be cropped to its visible region below)
+    let mut m = m;
     if opts.effects {
+        let fx = || item.effects.iter().filter(|e| e.def().is_some_and(|d| !d.intrinsic) && !filmcraft_project::graphic::is_layer(e));
+        if roi::enabled() && !item.has_opacity_masks() && fx().next().is_some() {
+            let probe = effects::FxCtx {
+                t: mt,
+                px_scale,
+                seconds: (t - item.start).seconds(),
+                timecode: tc,
+                clip_name: &item.name,
+                project: Some(project),
+                env: None,
+                working: seq.settings.color.working,
+            };
+            if let Some([x0, y0, x1, y1]) = roi::visible_region(layer.w, layer.h, &m, w, h, fx(), &probe) {
+                layer = layer.cropped(x0, y0, x1, y1);
+                m = m.then_apply(&Affine::translate(x0 as f64, y0 as f64));
+            }
+        }
         let env = vfx::ItemEnv { project, seq, item, t, opts, sources, want, layer_size: (layer.w, layer.h), layer_to_output: m, tc };
         let cx = effects::FxCtx {
             t: mt,
@@ -327,7 +347,7 @@ pub(crate) fn item_layer(
             env: Some(&env),
             working: seq.settings.color.working,
         };
-        for e in item.effects.iter().filter(|e| e.def().is_some_and(|d| !d.intrinsic) && !filmcraft_project::graphic::is_layer(e)) {
+        for e in fx() {
             if filmcraft_media::cancel::cancelled() {
                 return None;
             }

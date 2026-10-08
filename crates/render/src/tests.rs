@@ -416,3 +416,29 @@ fn reduced_clips_hand_effects_the_wanted_size() {
     assert!(img.px.iter().all(|v| v.is_finite()));
     assert!(img.get(160, 90)[3] > 0.99, "centre covered by the 55 % clip");
 }
+
+#[test]
+fn visible_region_processing_matches_the_whole_picture() {
+    let (mut p, _red, ocean, _seq, map) = setup();
+    // a 9:16 sequence showing the middle slice of the 16:9 ocean picture, like a vertical reframe
+    let seq = p.new_sequence("v", SequenceSettings { width: 90, height: 160, frame_rate: FrameRate::FPS_24, ..Default::default() }, 1, 1, None);
+    let r = FrameRate::FPS_24;
+    let (_, src_h) = source_size(&p, ocean).unwrap();
+    let mut ti = p.make_track_item(ocean, TrackKind::Video, Tick::ZERO, TimeRange::new(Tick::ZERO, r.tick_of(48)), r).unwrap();
+    ti.effect_mut("motion").unwrap().params.get_mut("scale").unwrap().value = ParamValue::Float(160.0 / src_h as f64 * 100.0);
+    let mut blur = filmcraft_project::find_effect("gaussian_blur").unwrap().instance();
+    blur.params.get_mut("blurriness").unwrap().value = ParamValue::Float(30.0);
+    let mut bc = filmcraft_project::find_effect("brightness_contrast").unwrap().instance();
+    bc.params.get_mut("brightness").unwrap().value = ParamValue::Float(-25.0);
+    ti.effects.push(blur);
+    ti.effects.push(bc);
+    p.sequence_mut(seq).unwrap().video_tracks[0].items.push(ti);
+    let cropped = render_sequence(&p, seq, Tick(1000), RenderOptions::default(), &map);
+    crate::roi::DISABLED_FOR_TEST.store(true, std::sync::atomic::Ordering::SeqCst);
+    let whole = render_sequence(&p, seq, Tick(1000), RenderOptions::default(), &map);
+    crate::roi::DISABLED_FOR_TEST.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!((cropped.w, cropped.h), (whole.w, whole.h));
+    let worst = cropped.px.iter().zip(&whole.px).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    assert!(worst < 1e-4, "visible output differs by {worst}");
+    assert!(cropped.get(45, 80)[3] > 0.99, "picture present");
+}
