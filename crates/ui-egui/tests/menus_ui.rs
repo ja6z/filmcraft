@@ -1,6 +1,6 @@
 //! Headless UI tests of the M3.11 menu long tail: Find, Create Search Bin (and its Project panel
 //! rows), Project Settings, Scene Edit Detection, Simplify Sequence, Automate to Sequence,
-//! Normalize Mix Track, Dynamic Audio Waveforms, Reveal Log Files and the System Compatibility
+//! Normalize Mix Track, Add Beat Markers, Dynamic Audio Waveforms, Reveal Log Files and the System Compatibility
 //! Report, all driven by automation id through the control channel.
 
 use std::sync::mpsc::{Sender, channel};
@@ -267,4 +267,34 @@ fn clip_and_sequence_dialogs() {
     assert_eq!(d.app().ui.extras.dialog.as_ref().unwrap().info[0]["video"]["width"], 1920);
     d.click("properties.ok");
     assert!(!d.dialog_open());
+}
+
+#[test]
+fn add_beat_markers_dialog() {
+    let mut d = Driver::new();
+    // generated music (120 BPM, 16 bars) on A1 of a new sequence
+    let (m, _) = filmcraft_audio_dsp::remix::test_music(48_000, 120.0, 16, 3);
+    let inter: Vec<f32> = (0..m[0].len()).flat_map(|i| [m[0][i], m[1][i]]).collect();
+    let dir = std::env::temp_dir().join(format!("filmcraft-beat-markers-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let wav = dir.join("music.wav");
+    std::fs::write(&wav, filmcraft_engine::previews::write_wav_f32(&inter, 48_000)).unwrap();
+    d.exec("file.newSequence", json!({"name": "Beats", "audio": 1, "video": 1, "fps": 30.0}));
+    let item = d.exec("file.import", json!({"paths": [wav.to_string_lossy()]}))["items"][0].as_u64().unwrap();
+    let r = d.exec("timeline.place", json!({"item": item, "audioTrack": "A1", "seconds": 0.0}));
+    let clip = r["clips"][0].as_u64().unwrap();
+    d.exec("timeline.select", json!({"clips": [clip]}));
+    assert_eq!(d.menu("markers.addBeatMarkers")["dialog"], "beatMarkers");
+    for id in ["beatMarkers.analyse", "beatMarkers.every.bar", "beatMarkers.beatsPerBar.3", "beatMarkers.tempo.half", "beatMarkers.replace", "beatMarkers.ok"] {
+        assert!(d.has(id), "{id}");
+    }
+    assert_eq!(d.app().ui.extras.dialog.as_ref().unwrap().params["analyse"], "clip");
+    d.click("beatMarkers.every.bar");
+    d.click("beatMarkers.ok");
+    assert!(!d.dialog_open());
+    let ms = d.app().session.active_sequence().unwrap().markers.clone();
+    assert!((15..=16).contains(&ms.len()), "{} bar markers", ms.len());
+    assert!(ms.iter().all(|m| m.name.ends_with(".1")));
+    assert!(d.app().ui.status.starts_with("Beat markers: "), "{}", d.app().ui.status);
+    let _ = std::fs::remove_dir_all(&dir);
 }

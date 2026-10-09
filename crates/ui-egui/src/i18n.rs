@@ -128,6 +128,7 @@ const SPANISH: &[(&str, &str)] = &[
     ("Add Audio Submix Track", "Añadir pista de submezcla de audio"),
     ("Add Caption at Playhead", "Añadir subtítulo en el cabezal"),
     ("Add Chapter Marker…", "Añadir marcador de capítulo…"),
+    ("Add Beat Markers…", "Añadir marcadores de beat…"),
     ("Add Edit", "Añadir edición"),
     ("Add Edit to All Tracks", "Añadir edición a todas las pistas"),
     ("Add Flash Cue Marker…", "Añadir marcador de referencia Flash…"),

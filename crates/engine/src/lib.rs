@@ -12,6 +12,7 @@
 
 pub mod aaf_omf;
 pub mod autosave;
+pub mod beat_markers;
 pub mod captions;
 pub mod clip_ops;
 pub mod color;
@@ -988,6 +989,8 @@ mod aaf_omf_tests;
 mod audio_effects_tests;
 #[cfg(test)]
 mod autosave_tests;
+#[cfg(test)]
+mod beat_markers_tests;
 #[cfg(test)]
 mod clip_ops_tests;
 #[cfg(test)]

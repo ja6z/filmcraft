@@ -413,6 +413,17 @@ clip media (source In … +duration) ─► audio_dsp::remix::analyze: spectral-
 
 Clip ▸ Remix ▸ Enable Remix / Remix Properties… / Revert Remix (`clip.remix.*`; agents can use `clip.remix {duration|seconds…}`) and the Remix tool in the Rate Stretch group (drag a music clip's Out edge) retime a music clip to a target duration. The analysis finds the beat and compares every pair of beats by harmony (chroma) and timbre (cepstra). Each joint leaves the music at one beat boundary and continues at the beat boundary whose four beats on either side sound most alike. The intro and outro are kept, and the result lands within one beat of the target. Segments (0–100) sets the number of joints (1–3, more for long extensions). Variations (0–100) sets how far a joint may move from its evenly spaced position (±1–8 beats). The state is a hidden effect instance with no definition, so panels, the effect chain and Paste Attributes ignore it. The plan is stored in ticks, so playback and export read it without re-analysing. A remix never moves other clips: one that would overlap the next clip is refused, and Revert restores the original duration. Results are deterministic and the analysis is cached per media range.
 
+### 5.1.4 Beat markers
+
+```text
+clip span / Mix / one track between In and Out ─► render::audio::mix_sequence (as it plays) → mono, ≤ 32 kHz
+  ─► audio_dsp::beats::detect: remix's beat tracker → beat attacks (± ~10 ms), tempo (Auto / Half / Double)
+  → downbeat: bar phase with the most chroma change + low-end (< 200 Hz) attack
+  ─► sequence markers "bar.beat" on the nearest frame, comment "Beat · <BPM> BPM", one undo step
+```
+
+Markers ▸ Add Beat Markers… (`markers.addBeatMarkers {clip?, track?, every?, beatsPerBar?, tempo?, color?, barColor?, replace?}`) marks the beats of the music so clips, cuts and keyframes snap to them (snapping already includes sequence markers). It analyses the selected audio clip over its span, its track alone, by default. Otherwise it analyses the Mix or one audio track between In and Out, the whole sequence when there are no marks, up to 20 minutes. A muted track is still analysed when asked for by name. Markers go on every beat, every 2 beats, every bar or every 2 bars, counted from the estimated first beat of a bar. That downbeat is the bar phase whose beats carry the most harmonic change and kick/bass attack, so bar markers land on the "one". The first beat of a bar gets its own colour (Rose; the other beats Yellow). Running it again replaces only the markers it added (comment prefix `Beat · `) in the analysed range. Tempo is ambiguous by octaves: Half keeps the stronger of the two beat phases and Double adds a beat halfway between two.
+
 ### 5.2 Essential Sound
 
 ```text

@@ -1,7 +1,7 @@
 //! Menu long tail (M3.11): the dialogs of Find, Create Search Bin, Project Settings (General /
 //! Scratch Disks / Ingest Settings), Get Media File Properties, Edit Offline, Source Settings,
 //! Update Metadata, Automate to Sequence, Scene Edit Detection, Normalize Mix Track, Simplify
-//! Sequence, Transcribe Sequence, Save as Template, Add Flash Cue Marker and the System
+//! Sequence, Transcribe Sequence, Save as Template, Add Flash Cue Marker, Add Beat Markers and the System
 //! Compatibility Report; plus the frontend side of Edit Original / Reveal Log Files (the OS
 //! opener), Generate Audio Waveform (the timeline's peak cache), Import from Media Browser (the
 //! Media Browser selection) and View ▸ Dynamic Audio Waveforms.
@@ -66,6 +66,7 @@ fn meta(command: &str) -> Option<(&'static str, &'static str, &'static str)> {
         "sequence.transcribe" => ("Transcribe Sequence", "transcribe", "Transcribe"),
         "file.saveAsTemplate" => ("Save as Template", "saveTemplate", "Save"),
         "markers.addFlashCue" => ("Flash Cue Marker", "flashCue", "OK"),
+        "markers.addBeatMarkers" => ("Add Beat Markers", "beatMarkers", "Add"),
         "help.systemCompatibilityReport" => ("System Compatibility Report", "systemReport", "Close"),
         _ => return None,
     })
@@ -88,6 +89,7 @@ fn dialog_command(id: &str) -> Option<&'static str> {
         "sequence.transcribe" => "sequence.transcribe",
         "file.saveAsTemplate" => "file.saveAsTemplate",
         "markers.addFlashCue" => "markers.addFlashCue",
+        "markers.addBeatMarkers" => "markers.addBeatMarkers",
         _ => return None,
     })
 }
@@ -332,6 +334,17 @@ fn defaults(app: &mut FilmcraftApp, cmd: &str, id: &str) -> Result<(Value, Value
         }
         "file.saveAsTemplate" => (json!({"name": s.project.name}), Value::Null),
         "markers.addFlashCue" => (json!({"name": "", "comment": ""}), Value::Null),
+        "markers.addBeatMarkers" => {
+            let q = s.active_sequence();
+            let tracks: Vec<String> = q.map(|q| (1..=q.audio_tracks.len()).map(|i| format!("A{i}")).collect()).unwrap_or_default();
+            let clip = q.is_some_and(|q| {
+                s.state.selection.iter().any(|c| q.find_item(*c).and_then(|(t, _)| q.track(t)).is_some_and(|t| t.kind == filmcraft_project::TrackKind::Audio))
+            });
+            (
+                json!({"analyse": if clip { "clip" } else { "mix" }, "every": "1", "beatsPerBar": "4", "tempo": "auto", "replace": true}),
+                json!({"tracks": tracks, "clip": clip}),
+            )
+        }
         _ => (json!({}), Value::Null),
     })
 }
@@ -687,6 +700,39 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
                 check(ui, &mut elems, pre, p, "diarize", "Recognize when different speakers are talking");
             }
             "file.saveAsTemplate" => text(ui, &mut elems, pre, p, "name", "Template Name:", 240.0),
+            "markers.addBeatMarkers" => {
+                let mut sources: Vec<(String, String)> = Vec::new();
+                if d.info["clip"].as_bool().unwrap_or(false) {
+                    sources.push(("clip".into(), "Selected audio clip".into()));
+                }
+                sources.push(("mix".into(), "Mix".into()));
+                sources.extend(
+                    d.info["tracks"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                        .iter()
+                        .filter_map(|t| t.as_str())
+                        .map(|t| (t.to_string(), format!("Audio on track {t}"))),
+                );
+                combo(ui, &mut elems, "beatMarkers.analyse", "Analyse:", &mut p["analyse"], &sources);
+                ui.label(RichText::new("The Mix and tracks are analysed between In and Out (the whole sequence without marks).").weak());
+                radios(
+                    ui,
+                    &mut elems,
+                    pre,
+                    p,
+                    "every",
+                    "Marker:",
+                    &[("1", "Every beat"), ("2", "Every 2 beats"), ("bar", "Every bar"), ("2bars", "Every 2 bars")],
+                );
+                radios(ui, &mut elems, pre, p, "beatsPerBar", "Time signature:", &[("4", "4/4"), ("3", "3/4"), ("2", "2/4")]);
+                radios(ui, &mut elems, pre, p, "tempo", "Tempo:", &[("auto", "Auto"), ("half", "Half"), ("double", "Double")]);
+                check(ui, &mut elems, pre, p, "replace", "Replace the beat markers added before");
+                if let Some(r) = d.info["result"].as_str() {
+                    ui.label(r);
+                }
+            }
             "markers.addFlashCue" => {
                 text(ui, &mut elems, pre, p, "name", "Name:", 220.0);
                 text(ui, &mut elems, pre, p, "comment", "Comments:", 220.0);
@@ -805,6 +851,19 @@ fn run(app: &mut FilmcraftApp, d: &ClipDialogDraft) -> Result<Option<String>, St
         "file.saveAsTemplate" => {
             let r = s.execute("file.saveAsTemplate", p.clone()).map_err(|e| e.to_string())?;
             app.ui.status = format!("Saved template {}", r["path"].as_str().unwrap_or_default());
+            Ok(None)
+        }
+        "markers.addBeatMarkers" => {
+            let mut q = json!({"every": p["every"], "tempo": p["tempo"], "replace": p["replace"]});
+            q["beatsPerBar"] = json!(p["beatsPerBar"].as_str().and_then(|v| v.parse::<u64>().ok()).unwrap_or(4));
+            if let Some(n) = p["every"].as_str().and_then(|v| v.parse::<u64>().ok()) {
+                q["every"] = json!(n);
+            }
+            if p["analyse"] != "clip" {
+                q["track"] = p["analyse"].clone();
+            }
+            let r = s.execute("markers.addBeatMarkers", q).map_err(|e| e.to_string())?;
+            app.ui.status = format!("Beat markers: {} added · {} BPM", r["markers"], r["bpm"]);
             Ok(None)
         }
         "clip.sceneEditDetection" => {

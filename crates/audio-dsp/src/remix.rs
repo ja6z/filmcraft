@@ -167,12 +167,20 @@ fn hann(n: usize) -> Vec<f32> {
 
 /// Magnitude spectra of `x` with frame `n` and `hop` (frames start at `t·hop`).
 fn stft_mag(x: &[f32], n: usize, hop: usize) -> Vec<Vec<f32>> {
+    let mut out = Vec::new();
+    stft_each(x, n, hop, |_, m| out.push(m.to_vec()));
+    out
+}
+
+/// Call `f(t, magnitudes)` for each STFT frame of `x` (frame `n`, Hann window, frames start at
+/// `t·hop`; `n / 2 + 1` bins).
+pub(crate) fn stft_each(x: &[f32], n: usize, hop: usize, mut f: impl FnMut(usize, &[f32])) {
     let fft = Fft::new(n);
     let w = hann(n);
     let frames = if x.len() >= n { (x.len() - n) / hop + 1 } else { 1 };
     let mut re = vec![0f32; n];
     let mut im = vec![0f32; n];
-    let mut out = Vec::with_capacity(frames);
+    let mut mag = vec![0f32; n / 2 + 1];
     for t in 0..frames {
         let s = t * hop;
         for i in 0..n {
@@ -180,14 +188,16 @@ fn stft_mag(x: &[f32], n: usize, hop: usize) -> Vec<Vec<f32>> {
             im[i] = 0.0;
         }
         fft.forward(&mut re, &mut im);
-        out.push((0..n / 2 + 1).map(|k| (re[k] * re[k] + im[k] * im[k]).sqrt()).collect());
+        for (k, m) in mag.iter_mut().enumerate() {
+            *m = (re[k] * re[k] + im[k] * im[k]).sqrt();
+        }
+        f(t, &mag);
     }
-    out
 }
 
 /// STFT frame for the onset envelope: the power of two nearest to 46 ms (1024 at 22.05 kHz, 2048
 /// at 44.1/48 kHz).
-fn onset_frame(sr: u32) -> usize {
+pub(crate) fn onset_frame(sr: u32) -> usize {
     let n = (sr as f64 * 0.046).max(256.0);
     1usize << n.log2().round() as u32
 }
@@ -196,16 +206,18 @@ fn onset_frame(sr: u32) -> usize {
 const MIN_PULSE: f64 = 0.1;
 
 /// Onset strength per hop: half-wave rectified log-magnitude spectral flux, normalised to unit
-/// standard deviation. Returns (envelope, frame size, hop).
+/// standard deviation. Returns (envelope, frame size, hop). Streams the STFT (one frame of
+/// spectrum in memory), so long music costs no more memory than its samples.
 pub fn onset_envelope(x: &[f32], sr: u32) -> (Vec<f32>, usize, usize) {
     let n = onset_frame(sr);
     let hop = n / 4;
-    let mags = stft_mag(x, n, hop);
-    let mut env = vec![0f32; mags.len()];
-    let lg: Vec<Vec<f32>> = mags.iter().map(|m| m.iter().map(|v| (1.0 + 1000.0 * v).ln()).collect()).collect();
-    for t in 1..lg.len() {
-        env[t] = lg[t].iter().zip(&lg[t - 1]).map(|(a, b)| (a - b).max(0.0)).sum();
-    }
+    let mut env = Vec::new();
+    let mut prev: Vec<f32> = Vec::new();
+    stft_each(x, n, hop, |_, m| {
+        let lg: Vec<f32> = m.iter().map(|v| (1.0 + 1000.0 * v).ln()).collect();
+        env.push(if prev.is_empty() { 0.0 } else { lg.iter().zip(&prev).map(|(a, b)| (a - b).max(0.0)).sum() });
+        prev = lg;
+    });
     let mean = env.iter().sum::<f32>() / env.len().max(1) as f32;
     let sd = (env.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / env.len().max(1) as f32).sqrt();
     if sd > 0.0 {
@@ -380,7 +392,7 @@ fn beat_features(x: &[f32], sr: u32, beats: &[i64]) -> (Vec<[f32; 12]>, Vec<[f32
     (chroma, cep)
 }
 
-fn cos(a: &[f32; 12], b: &[f32; 12]) -> f32 {
+pub(crate) fn cos(a: &[f32; 12], b: &[f32; 12]) -> f32 {
     let d: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
     let na = a.iter().map(|v| v * v).sum::<f32>().sqrt();
     let nb = b.iter().map(|v| v * v).sum::<f32>().sqrt();
@@ -392,16 +404,40 @@ pub fn beat_lead(sample_rate: u32) -> i64 {
     (XFADE_S * 0.5 * sample_rate as f64).round() as i64
 }
 
-fn local_max(env: &[f32], t: usize, r: usize) -> f32 {
+pub(crate) fn local_max(env: &[f32], t: usize, r: usize) -> f32 {
     env[t.saturating_sub(r)..(t + r + 1).min(env.len())].iter().copied().fold(0.0, f32::max)
 }
 
-/// Analyse planar audio (channels are summed to mono).
-pub fn analyze(channels: &[&[f32]], sample_rate: u32) -> Result<Analysis, RemixError> {
+/// The beats a [`track`] found: envelope frames of the beats, the onset envelope, its STFT frame and
+/// hop, and the beat period in envelope frames.
+pub(crate) struct Tracked {
+    pub frames: Vec<usize>,
+    pub env: Vec<f32>,
+    pub n: usize,
+    pub hop: usize,
+    pub period: f64,
+}
+
+impl Tracked {
+    /// Sample position of the attack of the beat at envelope frame `t`: the flux of frame t peaks
+    /// as soon as an attack enters the newer window, at about t·hop + n − ¾·hop (measured on
+    /// generated drums).
+    pub fn attack(&self, t: usize) -> i64 {
+        (t * self.hop + self.n) as i64 - 3 * self.hop as i64 / 4
+    }
+}
+
+/// Mono mix of planar audio.
+pub(crate) fn mono(channels: &[&[f32]]) -> Vec<f32> {
     let len = channels.iter().map(|c| c.len()).max().unwrap_or(0);
     let k = 1.0 / channels.len().max(1) as f32;
-    let mono: Vec<f32> = (0..len).map(|i| channels.iter().map(|c| c.get(i).copied().unwrap_or(0.0)).sum::<f32>() * k).collect();
-    let (env, n, hop) = onset_envelope(&mono, sample_rate);
+    (0..len).map(|i| channels.iter().map(|c| c.get(i).copied().unwrap_or(0.0)).sum::<f32>() * k).collect()
+}
+
+/// Onset envelope → tempo → dynamic-programming beats, without the weak or off-grid beats at the
+/// edges (silence before / after the music).
+pub(crate) fn track(mono: &[f32], sample_rate: u32) -> Result<Tracked, RemixError> {
+    let (env, n, hop) = onset_envelope(mono, sample_rate);
     let frame_rate = sample_rate as f64 / hop as f64;
     let period = tempo(&env, frame_rate).ok_or(RemixError::NoBeat)?;
     let mut frames = track_beats(&env, period);
@@ -423,11 +459,19 @@ pub fn analyze(channels: &[&[f32]], sample_rate: u32) -> Result<Analysis, RemixE
     while frames.len() > 2 && off_grid(frames[0], frames[1]) {
         frames.remove(0);
     }
-    // the flux of frame t peaks as soon as an attack enters the newer window, at about
-    // t·hop + n − ¾·hop (measured on generated drums); joints sit half a crossfade earlier so a joint's fade is over
-    // when the beat's attack starts
-    let mut beats: Vec<i64> =
-        frames.iter().map(|&t| (t * hop + n) as i64 - 3 * hop as i64 / 4 - beat_lead(sample_rate)).filter(|&b| b > 0 && b < len as i64).collect();
+    Ok(Tracked { frames, env, n, hop, period })
+}
+
+/// Analyse planar audio (channels are summed to mono).
+pub fn analyze(channels: &[&[f32]], sample_rate: u32) -> Result<Analysis, RemixError> {
+    let mono = mono(channels);
+    let len = mono.len();
+    let tr = track(&mono, sample_rate)?;
+    let hop = tr.hop;
+    let period = tr.period;
+    // joints sit half a crossfade before the attack so a joint's fade is over when the beat's
+    // attack starts
+    let mut beats: Vec<i64> = tr.frames.iter().map(|&t| tr.attack(t) - beat_lead(sample_rate)).filter(|&b| b > 0 && b < len as i64).collect();
     beats.dedup();
     if beats.len() < 2 * MIN_PIECE_BEATS + 2 {
         return Err(if beats.len() < 4 { RemixError::NoBeat } else { RemixError::TooShort });

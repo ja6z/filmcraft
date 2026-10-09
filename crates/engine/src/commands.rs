@@ -2472,6 +2472,7 @@ fn build() -> Vec<CommandSpec> {
     v.extend(crate::panels::commands());
     v.extend(crate::scopes::commands());
     v.extend(crate::remix::commands());
+    v.extend(crate::beat_markers::commands());
     v.extend(crate::voiceover::commands());
     v.extend(crate::keyboard::commands());
     v.extend(crate::project_panel::commands());
@@ -2564,7 +2565,7 @@ fn keyframe_op(s: &mut Session, p: &Value, op: &str) -> Result<Value> {
     Ok(Value::Null)
 }
 
-fn in_out_range(s: &Session) -> Result<TimeRange> {
+pub(crate) fn in_out_range(s: &Session) -> Result<TimeRange> {
     let q = s.active_sequence().ok_or(EngineError::NoSequence)?;
     let fd = q.settings.frame_rate.frame_duration();
     let a = q.mark_in.unwrap_or(Tick::ZERO);

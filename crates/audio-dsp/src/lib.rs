@@ -5,6 +5,7 @@
 //! * [`effects`] — clip/track audio effects behind the common [`AudioEffect`] trait, with a
 //!   registry ([`effects()`]) describing every effect's parameters (range, unit, default) so the
 //!   engine and UI can build controls generically.
+//! * [`beats`] — beat detection: beat attacks, tempo and the first beat of each bar (beat markers).
 //! * [`biquad`] — RBJ-cookbook biquads (TDF-II) with analytic magnitude response.
 //! * [`sync`] — offset between two recordings of one event (GCC-PHAT, sample-accurate).
 //! * [`resample`] — streaming, block-invariant rate conversion for playback on a device at another rate.
@@ -19,6 +20,7 @@
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
+pub mod beats;
 pub mod biquad;
 pub mod channels;
 pub mod design;

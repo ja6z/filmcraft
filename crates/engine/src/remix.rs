@@ -38,7 +38,7 @@ fn cache() -> &'static Mutex<Vec<(Key, Arc<Analysis>)>> {
 }
 
 /// The audio clip a menu command works on: the first selected clip on an audio track.
-fn selected_audio(s: &Session) -> Option<ClipId> {
+pub(crate) fn selected_audio(s: &Session) -> Option<ClipId> {
     let seq = s.active_sequence()?;
     s.state.selection.iter().copied().find(|c| seq.find_item(*c).and_then(|(t, _)| seq.track(t)).is_some_and(|t| t.kind == TrackKind::Audio))
 }
