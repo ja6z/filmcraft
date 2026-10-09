@@ -13,6 +13,9 @@
 //! radius costs O(1) per pixel like on the CPU (radii are capped by `gaussian_boxes`).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use filmcraft_color::Lut3d;
 
 use filmcraft_render::gpufx::FxOp;
 use filmcraft_render::plan::LayerFx;
@@ -49,6 +52,10 @@ const OP_HFLIP: u32 = 26;
 const OP_VFLIP: u32 = 27;
 const OP_MIRROR: u32 = 28;
 const OP_OFFSET: u32 = 29;
+const OP_LUT3: u32 = 30;
+const OP_VIGNETTE: u32 = 31;
+/// Baked LUT textures kept between frames.
+const LUT_CACHE: usize = 16;
 
 type Target = (wgpu::Texture, wgpu::TextureView);
 
@@ -60,6 +67,8 @@ pub(crate) struct FxStage {
     source: wgpu::RenderPipeline,
     pool: HashMap<(u32, u32), Vec<Target>>,
     used: HashSet<(u32, u32)>,
+    /// Baked LUTs (`FxOp::Lut3`) as n² × n textures, by bake key, oldest first.
+    luts: Vec<(u64, Target)>,
 }
 
 /// One compute pass of a job.
@@ -90,6 +99,8 @@ struct Step {
     combine: bool,
     /// A blur pass of Unsharp Mask (the original stays untouched until the combine).
     unsharp_blur: bool,
+    /// A baked LUT the pass reads (bound as `aux`).
+    lut: Option<(u64, Arc<Lut3d>)>,
 }
 
 fn step(code: u32, i1: [u32; 4], p: &[f32]) -> Step {
@@ -97,7 +108,7 @@ fn step(code: u32, i1: [u32; 4], p: &[f32]) -> Step {
     for (d, s) in q.iter_mut().zip(p) {
         *d = *s;
     }
-    Step { run: false, code, i1, p: q, combine: false, unsharp_blur: false }
+    Step { run: false, code, i1, p: q, combine: false, unsharp_blur: false, lut: None }
 }
 
 /// Box passes along x (vertical = false) or y for the radii (radius 0 is a no-op on the CPU).
@@ -113,6 +124,12 @@ fn boxes(radii: &[u32], vertical: bool, repeat: bool, out: &mut Vec<Step>) {
 fn steps(op: &FxOp) -> Vec<Step> {
     let mut out = Vec::new();
     match op {
+        FxOp::Lut3 { key, lut } => {
+            let mut s = step(OP_LUT3, [lut.size as u32, 0, 0, 0], &[]);
+            s.lut = Some((*key, lut.clone()));
+            out.push(s);
+        }
+        FxOp::Vignette { p } => out.push(step(OP_VIGNETTE, [0; 4], p)),
         FxOp::BrightnessContrast { br, co } => out.push(step(OP_BRIGHTNESS_CONTRAST, [0; 4], &[*br, *co])),
         FxOp::ProcAmp { br, co, hue, sat } => out.push(step(OP_PROC_AMP, [0; 4], &[*br, *co, *hue, *sat])),
         FxOp::Tint { black, white, amount } => {
@@ -261,7 +278,7 @@ impl FxStage {
             multiview_mask: None,
             cache: None,
         });
-        Self { px: compute("fx_px"), run: compute("fx_run"), bgl, source, pool: HashMap::new(), used: HashSet::new() }
+        Self { px: compute("fx_px"), run: compute("fx_run"), bgl, source, pool: HashMap::new(), used: HashSet::new(), luts: Vec::new() }
     }
 
     /// Start a frame: pooled textures of sizes no layer uses by [`end_frame`](Self::end_frame)
@@ -279,6 +296,41 @@ impl FxStage {
     #[cfg(test)]
     pub(crate) fn is_idle(&self) -> bool {
         self.pool.is_empty()
+    }
+
+    /// The texture of a baked LUT (uploaded once per bake key).
+    fn lut_view(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, key: u64, lut: &Lut3d) -> Option<wgpu::TextureView> {
+        if let Some((_, (_, v))) = self.luts.iter().find(|(k, _)| *k == key) {
+            return Some(v.clone());
+        }
+        let n = lut.size as u32;
+        if n < 2 || lut.data.len() != (n * n * n) as usize || n * n > device.limits().max_texture_dimension_2d {
+            return None;
+        }
+        let size = wgpu::Extent3d { width: n * n, height: n, depth_or_array_layers: 1 };
+        let t = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("filmcraft-fx-lut"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: FX_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let bytes: Vec<u8> = lut.data.iter().flat_map(|c| [c[0], c[1], c[2], 1.0]).flat_map(f32::to_le_bytes).collect();
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &t, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            &bytes,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(n * n * 16), rows_per_image: Some(n) },
+            size,
+        );
+        let v = t.create_view(&Default::default());
+        self.luts.push((key, (t, v.clone())));
+        if self.luts.len() > LUT_CACHE {
+            self.luts.remove(0);
+        }
+        Some(v)
     }
 
     fn targets(&mut self, device: &wgpu::Device, size: (u32, u32), n: usize) -> Vec<Target> {
@@ -336,8 +388,13 @@ impl FxStage {
             }
             let keep = if s.unsharp_blur || s.combine { orig } else { None };
             let dst = (0..n).find(|k| *k != cur && Some(*k) != keep)?;
-            let aux = match (s.combine, orig) {
-                (true, Some(o)) => views.get(o)?,
+            let lut_view = match &s.lut {
+                Some((key, lut)) => Some(self.lut_view(device, queue, *key, lut)?),
+                None => None,
+            };
+            let aux = match (s.combine, orig, &lut_view) {
+                (_, _, Some(l)) => l,
+                (true, Some(o), _) => views.get(o)?,
                 _ => dummy,
             };
             let mut bytes = Vec::with_capacity(96);

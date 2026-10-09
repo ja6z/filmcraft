@@ -599,7 +599,10 @@ fn create_multicam(s: &mut Session, p: &Value) -> Result<Value> {
         Some(a) => MulticamAudio::from_name(a).ok_or_else(|| bad(cmd, format!("unknown audio mode `{a}` (camera1, all, switch)")))?,
         None => MulticamAudio::Camera1,
     };
-    let settings = settings_for(s, clips[reference].item);
+    // frame size and rate come from the reference camera; an audio-only reference (a music
+    // master, a recorder) has neither, so the first camera with video gives them
+    let shape = if has_v(s, &clips[reference]) { reference } else { 0 };
+    let settings = settings_for(s, clips[shape].item);
     let rate = settings.frame_rate;
     let anchors = sync::anchors(s, &clips, reference, &method, offset_p(p, rate))?;
     let starts = sync::placements(&clips, &anchors, rate, false);

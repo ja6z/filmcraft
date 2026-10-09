@@ -15,7 +15,8 @@ struct U {
 @group(0) @binding(0) var<uniform> u: U;
 @group(0) @binding(1) var src: texture_2d<f32>;
 @group(0) @binding(2) var dst: texture_storage_2d<rgba32float, write>;
-// Unsharp Mask: the image before blurring.
+// Unsharp Mask: the image before blurring. Lut3: the baked 3D LUT, n² × n texels, entry
+// (r, g, b) at (r + g·n, b).
 @group(0) @binding(3) var aux: texture_2d<f32>;
 
 const OP_BRIGHTNESS_CONTRAST: u32 = 1u;
@@ -45,6 +46,8 @@ const OP_HFLIP: u32 = 26u;
 const OP_VFLIP: u32 = 27u;
 const OP_MIRROR: u32 = 28u;
 const OP_OFFSET: u32 = 29u;
+const OP_LUT3: u32 = 30u;
+const OP_VIGNETTE: u32 = 31u;
 
 fn size() -> vec2<i32> {
     return vec2<i32>(i32(u.i0.y), i32(u.i0.z));
@@ -125,6 +128,44 @@ fn enc(c: vec3<f32>) -> vec3<f32> {
 fn dec(c: vec3<f32>) -> vec3<f32> {
     let m = clamp(c, vec3(0.0), vec3(1.0));
     return vec3(srgb_to_linear1(m.x), srgb_to_linear1(m.y), srgb_to_linear1(m.z));
+}
+
+// ---- baked 3D LUT (`filmcraft_color::Lut3d::apply`, tetrahedral; n = i1.x, domain 0…1)
+
+fn lut_at(r: u32, g: u32, b: u32) -> vec3<f32> {
+    let n = u.i1.x;
+    return textureLoad(aux, vec2<i32>(i32(r + g * n), i32(b)), 0).xyz;
+}
+
+fn lut3(c: vec3<f32>) -> vec3<f32> {
+    let n = u.i1.x;
+    let t = clamp(c, vec3(0.0), vec3(1.0)) * f32(n - 1u);
+    let i = min(vec3<u32>(t), vec3(n - 2u));
+    let f = t - vec3<f32>(i);
+    let fr = f.x;
+    let fg = f.y;
+    let fb = f.z;
+    let c000 = lut_at(i.x, i.y, i.z);
+    let c111 = lut_at(i.x + 1u, i.y + 1u, i.z + 1u);
+    var ca: vec3<f32>;
+    var cb: vec3<f32>;
+    var w: vec4<f32>;
+    if fr > fg {
+        if fg > fb {
+            ca = lut_at(i.x + 1u, i.y, i.z); cb = lut_at(i.x + 1u, i.y + 1u, i.z); w = vec4(1.0 - fr, fr - fg, fg - fb, fb);
+        } else if fr > fb {
+            ca = lut_at(i.x + 1u, i.y, i.z); cb = lut_at(i.x + 1u, i.y, i.z + 1u); w = vec4(1.0 - fr, fr - fb, fb - fg, fg);
+        } else {
+            ca = lut_at(i.x, i.y, i.z + 1u); cb = lut_at(i.x + 1u, i.y, i.z + 1u); w = vec4(1.0 - fb, fb - fr, fr - fg, fg);
+        }
+    } else if fb > fg {
+        ca = lut_at(i.x, i.y, i.z + 1u); cb = lut_at(i.x, i.y + 1u, i.z + 1u); w = vec4(1.0 - fb, fb - fg, fg - fr, fr);
+    } else if fb > fr {
+        ca = lut_at(i.x, i.y + 1u, i.z); cb = lut_at(i.x, i.y + 1u, i.z + 1u); w = vec4(1.0 - fg, fg - fb, fb - fr, fr);
+    } else {
+        ca = lut_at(i.x, i.y + 1u, i.z); cb = lut_at(i.x + 1u, i.y + 1u, i.z); w = vec4(1.0 - fg, fg - fr, fr - fb, fb);
+    }
+    return w.x * c000 + w.y * ca + w.z * cb + w.w * c111;
 }
 
 fn luma709(c: vec3<f32>) -> f32 {
@@ -466,6 +507,46 @@ fn pixel(op: u32, p: vec2<i32>) -> vec4<f32> {
             let q = sample_clamped(uu, vv);
             let o = ld(p);
             return q + (o - q) * u.p0.z;
+        }
+        case OP_LUT3: {
+            let o = ld(p);
+            let a = o.a;
+            if a <= 1e-6 {
+                return o;
+            }
+            return vec4(lut3(enc(o.rgb / a)) * a, a);
+        }
+        case OP_VIGNETTE: {
+            // `effects::vignette_px` on the display-encoded value at the pixel's index
+            let o = ld(p);
+            let a = o.a;
+            if a <= 1e-6 {
+                return o;
+            }
+            let va = u.p0.x;
+            let vmid = u.p0.y;
+            let vround = u.p0.z;
+            let vfeather = u.p0.w;
+            let w = f32(s.x);
+            let h = f32(s.y);
+            var sx = 1.0;
+            if vround < 0.0 {
+                sx = powf(w / h, -vround);
+            }
+            let nx = (f32(p.x) / w - 0.5) * 2.0 * sx;
+            let ny = (f32(p.y) / h - 0.5) * 2.0;
+            let d = sqrt(nx * nx + ny * ny) / sqrt(2.0);
+            let edge = clamp((d - vmid * 0.9) / (max(vfeather, 0.01) * 0.9), 0.0, 1.0);
+            let e2 = edge * edge * (3.0 - 2.0 * edge);
+            let k = 1.0 + va * 0.2 * e2;
+            let v = enc(o.rgb / a);
+            var r: vec3<f32>;
+            if va < 0.0 {
+                r = v * max(k, 0.0);
+            } else {
+                r = v + (vec3(1.0) - v) * (k - 1.0);
+            }
+            return vec4(dec(r) * a, a);
         }
         default: {
             let o = ld(p);

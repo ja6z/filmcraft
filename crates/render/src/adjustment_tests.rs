@@ -185,3 +185,46 @@ fn nested_adjustment_layers_stay_in_their_sequence() {
     };
     assert_eq!(img.get(5, 5), plain.get(5, 5));
 }
+
+/// The preview plans an adjustment layer the GPU can run as an `adjust` layer, and the plan's CPU
+/// reference (what the compositor reproduces) matches the CPU render; one it can't run (a masked
+/// effect) keeps the whole-frame CPU fallback.
+#[test]
+fn gpu_plan_runs_adjustment_layers_like_the_cpu() {
+    let mut s = scene(3);
+    let ocean = media(&mut s.p, &mut s.map, GeneratorSource::demo(DemoScene::OceanSunset));
+    let blue = matte(&mut s.p, &mut s.map, [0.1, 0.2, 0.9, 1.0]);
+    place(&mut s.p, s.seq, 0, ocean);
+    let adj = adjustment(&mut s.p, s.seq, 1);
+    fx(&mut s, adj, "lumetri");
+    {
+        let l = clip(&mut s, adj).effects.iter_mut().find(|e| e.effect == "lumetri").unwrap();
+        for (k, v) in [("exposure", -0.4), ("contrast", 30.0), ("saturation", 120.0), ("vignette_amount", -0.8)] {
+            l.params.get_mut(k).unwrap().value = ParamValue::Float(v);
+        }
+        l.params.get_mut("vignette_on").unwrap().value = ParamValue::Bool(true);
+    }
+    clip(&mut s, adj).effect_mut("opacity").unwrap().params.get_mut("opacity").unwrap().value = ParamValue::Float(80.0);
+    // a small layer above the adjustment layer stays ungraded
+    let top = place(&mut s.p, s.seq, 2, blue);
+    clip(&mut s, top).effect_mut("motion").unwrap().params.get_mut("scale").unwrap().value = ParamValue::Float(30.0);
+    let t = R.tick_of(12);
+    let plan = crate::plan::plan_frame(&s.p, s.seq, t, RenderOptions::default(), &s.map);
+    let crate::plan::FramePlan::Layers { layers, .. } = &plan else { panic!("the adjustment layer fell back to the CPU") };
+    assert_eq!(layers.iter().filter(|l| l.adjust).count(), 1);
+    let gpu = crate::plan::execute_cpu(&plan).to_rgba8();
+    let cpu = render(&s).to_rgba8();
+    let (mut se, mut n) = (0f64, 0f64);
+    for (a, b) in gpu.as_chunks::<4>().0.iter().zip(cpu.as_chunks::<4>().0.iter()) {
+        for k in 0..3 {
+            se += (a[k] as f64 - b[k] as f64).powi(2);
+            n += 1.0;
+        }
+    }
+    let db = 10.0 * (255.0f64 * 255.0 / (se / n).max(1e-9)).log10();
+    assert!(db > 40.0, "plan vs CPU render: {db:.1} dB");
+    // a masked effect on the adjustment layer: the whole frame renders on the CPU, as before
+    let l = clip(&mut s, adj).effects.iter_mut().find(|e| e.effect == "lumetri").unwrap();
+    l.masks.push(Mask::new("m", MaskPath::rect(0.0, 0.0, 160.0, 180.0)));
+    assert!(matches!(crate::plan::plan_frame(&s.p, s.seq, t, RenderOptions::default(), &s.map), crate::plan::FramePlan::Image(_)));
+}

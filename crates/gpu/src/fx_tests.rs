@@ -395,6 +395,7 @@ fn gpu_effect_layers_match_cpu_plan() {
                     opacity: 1.0,
                     blend: Blend::Normal,
                     fx: Some(Arc::new(LayerFx { size: (320, 180), decimation: 2, ops: ops(&chain_c, 320, 180, 0.5) })),
+                    adjust: false,
                 },
                 PlanLayer {
                     frame: ramp.clone(),
@@ -402,6 +403,7 @@ fn gpu_effect_layers_match_cpu_plan() {
                     opacity: 0.8,
                     blend: mode,
                     fx: Some(Arc::new(LayerFx { size: (160, 120), decimation: 1, ops: ops(&chain_a, 160, 120, 1.0) })),
+                    adjust: false,
                 },
                 PlanLayer::new(ramp.clone(), Affine::translate(10.0, 20.0), 0.5, Blend::Normal),
                 PlanLayer {
@@ -410,6 +412,7 @@ fn gpu_effect_layers_match_cpu_plan() {
                     opacity: 0.7,
                     blend: mode,
                     fx: Some(Arc::new(LayerFx { size: (320, 180), decimation: 1, ops: ops(&chain_b, 320, 180, 1.0) })),
+                    adjust: false,
                 },
             ],
         };
@@ -488,4 +491,89 @@ fn layers_with_effects_fall_back_to_the_cpu_without_a_stage() {
         eprintln!("effect stage {stage}: interior p99 {p99}, mean {mean:.3}");
         assert!(p99 <= 6 && mean < 1.5, "stage {stage}: p99 {p99}, mean {mean}");
     }
+}
+
+fn lumetri(params: &[(&str, ParamValue)]) -> EffectInstance {
+    effect("lumetri", params)
+}
+
+/// Lumetri's preview ops (a baked 3D LUT, the vignette between the Basic and the Curves stage,
+/// the Creative sharpen) run in WGSL exactly as their CPU reference.
+#[test]
+fn lumetri_ops_match_their_cpu_reference() {
+    let Some((dev, q)) = device() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let mut c = GpuCompositor::new(&dev, &q);
+    let (w, h) = (96u32, 64u32);
+    let px = picture(w, h);
+    let frame = VideoFrame::rgba_f32(w, h, px.clone());
+    let input = format!("builtin:{}", filmcraft_render::luts::builtins()[0].id);
+    let cases = [
+        lumetri(&[("input_lut", ParamValue::Text(input)), ("exposure", fl(-0.65)), ("contrast", fl(28.0)), ("saturation", fl(97.0))]),
+        lumetri(&[
+            ("vignette_on", ParamValue::Bool(true)),
+            ("vignette_amount", fl(-0.8)),
+            ("vignette_roundness", fl(-30.0)),
+            ("curves_on", ParamValue::Bool(true)),
+            ("curve_luma", ParamValue::Curve(vec![[0.0, 0.0], [0.6, 0.62], [1.0, 0.9]])),
+        ]),
+        lumetri(&[("vignette_on", ParamValue::Bool(true)), ("vignette_amount", fl(1.5)), ("creative_on", ParamValue::Bool(true)), ("sharpen", fl(60.0))]),
+    ];
+    for e in cases {
+        let ops = filmcraft_render::gpufx::gpu_ops(&e, &cx(Tick::ZERO, 1.0), w as usize, h as usize).expect("GPU-capable");
+        let mut cpu = filmcraft_render::Image { w: w as usize, h: h as usize, px: px.clone() };
+        for op in &ops {
+            op.apply(&mut cpu);
+        }
+        let (_, _, gpu) = c.effect_image(&frame, &LayerFx { size: (w, h), decimation: 1, ops: ops.clone() }).expect("effect image");
+        let (worst, flips) = compare(&cpu.px, &gpu);
+        eprintln!("{} ops: max rel diff {worst:.2e}", ops.len());
+        assert!(worst < 2e-3 && flips == 0.0, "{ops:?}: {worst}, {flips}");
+    }
+}
+
+/// An adjustment layer runs on the GPU over the picture composited below it and is drawn over
+/// it with its opacity; layers above stay ungraded. Matches the plan's CPU reference.
+#[test]
+fn adjustment_layers_composite_like_the_cpu_plan() {
+    let Some((dev, q)) = device() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let (w, h) = (200u32, 150u32);
+    let grade = lumetri(&[("exposure", fl(-0.5)), ("contrast", fl(35.0)), ("vignette_on", ParamValue::Bool(true)), ("vignette_amount", fl(-1.0))]);
+    let mut ops = filmcraft_render::gpufx::gpu_ops(&grade, &cx(Tick::ZERO, 1.0), w as usize, h as usize).expect("gpu");
+    ops.extend(FxOp::eval(&effect("tint", &[("amount", fl(30.0))]), &cx(Tick::ZERO, 1.0), w as usize, h as usize));
+    let adjust = |opacity: f32| PlanLayer {
+        fx: Some(Arc::new(LayerFx { size: (w, h), decimation: 1, ops: ops.clone() })),
+        adjust: true,
+        ..PlanLayer::new(Arc::new(VideoFrame::rgba_f32(1, 1, vec![0.0; 4])), Affine::IDENTITY, opacity, Blend::Normal)
+    };
+    for opacity in [1.0, 0.6] {
+        let plan = FramePlan::Layers {
+            width: w as usize,
+            height: h as usize,
+            layers: vec![
+                PlanLayer::new(yuv_frame(w, h), Affine::IDENTITY, 1.0, Blend::Normal),
+                PlanLayer::new(ramp_layer(80, 60, 1), Affine::translate(20.0, 30.0), 0.9, Blend::Normal),
+                adjust(opacity),
+                PlanLayer::new(ramp_layer(40, 30, 3), Affine::translate(140.0, 100.0), 1.0, Blend::Normal),
+            ],
+        };
+        let cpu = execute_cpu(&plan).over_black_rgba8();
+        let mut c = GpuCompositor::new(&dev, &q);
+        c.composite(&plan);
+        let (_, _, gpu) = c.read_output().expect("readback");
+        let (p99, mean, max) = stats8(&cpu, &gpu, &interior(&plan));
+        eprintln!("adjustment at {opacity}: interior p99 {p99}, mean {mean:.3}, max {max}");
+        assert!(p99 <= 6 && mean < 1.5, "opacity {opacity}: p99 {p99}, mean {mean}");
+    }
+    // an adjustment layer with nothing below it: transparent stays transparent (black output)
+    let plan = FramePlan::Layers { width: w as usize, height: h as usize, layers: vec![adjust(1.0)] };
+    let mut c = GpuCompositor::new(&dev, &q);
+    c.composite(&plan);
+    let (_, _, gpu) = c.read_output().expect("readback");
+    assert!(gpu.chunks(4).all(|p| p[0] < 3 && p[1] < 3 && p[2] < 3), "an empty picture stays black");
 }

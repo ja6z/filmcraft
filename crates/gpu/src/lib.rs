@@ -594,7 +594,14 @@ impl GpuCompositor {
                     },
                     None => VideoFrame::rgba_f32(img.w as u32, img.h as u32, img.px.clone()),
                 };
-                owned = [PlanLayer { frame: Arc::new(frame), matrix: filmcraft_geom::Affine::IDENTITY, opacity: 1.0, blend: Blend::Normal, fx: None }];
+                owned = [PlanLayer {
+                    frame: Arc::new(frame),
+                    matrix: filmcraft_geom::Affine::IDENTITY,
+                    opacity: 1.0,
+                    blend: Blend::Normal,
+                    fx: None,
+                    adjust: false,
+                }];
                 (img.w as u32, img.h as u32, &owned[..])
             }
         };
@@ -613,7 +620,8 @@ impl GpuCompositor {
             .iter()
             .map(|l| {
                 let lfx = l.fx.as_ref()?;
-                if self.fx.is_some() && lfx.size.0.max(lfx.size.1) <= max_side {
+                // (an adjustment layer needs the stage: without it, it is left out below)
+                if l.adjust || (self.fx.is_some() && lfx.size.0.max(lfx.size.1) <= max_side) {
                     return None;
                 }
                 let img = filmcraft_render::plan::effect_image(&l.frame, lfx);
@@ -652,6 +660,28 @@ impl GpuCompositor {
             });
             let views = self.uploads.get(k).map_or_else(|| std::array::from_fn(|_| self.dummy.clone()), |up| up.views.clone());
             let job = match &l.fx {
+                Some(lfx) if l.adjust => {
+                    // an adjustment layer: its effects run on the accumulator (the picture so far)
+                    let acc = SrcInfo { kind: 1, code_scale: 1.0, alpha: 0.0, chroma: (w, h), size: (w, h), color: l.frame.color };
+                    let su = Self::uniforms(&acc, &filmcraft_geom::Affine::IDENTITY, 1.0, Blend::Normal, (w, h));
+                    let sbuf = self.uniform_buffer(&su);
+                    let sbg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("fx-adjust-source"),
+                        layout: &self.layer_bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry { binding: 0, resource: sbuf.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&accum_view) },
+                            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.dummy) },
+                            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.dummy) },
+                            wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&self.dummy) },
+                        ],
+                    });
+                    // (the plan sizes an adjustment's working image as the output)
+                    match self.fx.as_mut() {
+                        Some(f) if lfx.size == (w, h) => f.job(&self.device, &self.queue, lfx, sbg, &self.dummy),
+                        _ => None,
+                    }
+                }
                 Some(lfx) => {
                     // the source drawn onto the working image (box-decimated by n, as the CPU decodes)
                     let n = lfx.decimation.max(1) as f64;
@@ -681,6 +711,7 @@ impl GpuCompositor {
                     let s = SrcInfo { kind: 1, code_scale: 1.0, alpha: 0.0, chroma: l.size(), size: l.size(), color: l.frame.color };
                     (Self::uniforms(&s, &l.matrix, l.opacity, l.blend, (w, h)), [j.result.clone(), self.dummy.clone(), self.dummy.clone(), self.dummy.clone()])
                 }
+                None if l.adjust => (Self::uniforms(&src, &l.matrix, 0.0, l.blend, (w, h)), views),
                 None => {
                     // (a layer with effects only gets here if its job failed, which the CPU
                     // fallback above rules out; it is then drawn without them, where the working
@@ -733,6 +764,11 @@ impl GpuCompositor {
             // a layer's effects run right before it is drawn (pooled working textures are reused
             // by the next layer with effects)
             if let (Some(Some(job)), Some(f)) = (jobs.get(i), self.fx.as_ref()) {
+                // an adjustment layer reads the accumulator: it must exist even with nothing below
+                if layers.get(i).is_some_and(|l| l.adjust) && !cleared {
+                    accum_pass(&mut enc, &accum_view, wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT));
+                    cleared = true;
+                }
                 f.record(&mut enc, job);
             }
             if let Some((bg, Some(region))) = bind_groups.get(i) {

@@ -8,8 +8,16 @@
 //! [`FxOp`]s in a [`crate::plan::LayerFx`] and reproduces `apply` per pixel; the plan only hands an
 //! op to the GPU when [`FxOp::gpu_ok`] says the shader covers it (finite numbers, no minifying
 //! resample), otherwise the clip is rendered on the CPU as before.
+//!
+//! Lumetri is the exception to "CPU and GPU run the same ops": the CPU render keeps its exact
+//! per-pixel code, while the preview plan ([`gpu_ops`]) bakes Lumetri's colour stages into a
+//! 3D LUT over display-encoded 0…1 ([`FxOp::Lut3`], tetrahedral, 33³), runs the vignette as its
+//! own op ([`FxOp::Vignette`]) between the Basic and the Curves stages when it is on, and the
+//! Creative sharpen as an [`FxOp::Unsharp`]. Bakes are cached per evaluated parameter set.
 
-use filmcraft_color::{hsl_to_rgb, linear_to_srgb, luma709, rgb_to_hsl};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use filmcraft_color::{Lut3d, hsl_to_rgb, linear_to_srgb, luma709, rgb_to_hsl};
 use filmcraft_geom::Affine;
 use filmcraft_project::EffectInstance;
 use rayon::prelude::*;
@@ -32,6 +40,16 @@ pub struct Resample {
 /// One evaluated effect.
 #[derive(Clone, Debug, PartialEq)]
 pub enum FxOp {
+    /// A baked colour transform: display-encoded (sRGB curve) 0…1 in, linear light out
+    /// (Lumetri's colour stages; see [`gpu_ops`]). `key` identifies the bake.
+    Lut3 {
+        key: u64,
+        lut: Arc<Lut3d>,
+    },
+    /// Lumetri's vignette (amount, midpoint, roundness, feather) on the display-encoded image.
+    Vignette {
+        p: [f32; 4],
+    },
     BrightnessContrast {
         br: f32,
         co: f32,
@@ -197,6 +215,98 @@ pub const GPU_EFFECTS: &[&str] = &[
     "color_replace",
     "alpha_adjust",
 ];
+
+/// Lattice size of a baked Lumetri LUT.
+pub const BAKE_SIZE: usize = 33;
+
+/// The ops the preview plan runs on the GPU for `e` (None: render the clip on the CPU). Effects
+/// in [`GPU_EFFECTS`] map to their one [`FxOp::eval`] op; Lumetri (SDR, no HSL Denoise / Blur)
+/// to a baked LUT, the vignette between its stages and the Creative sharpen.
+pub fn gpu_ops(e: &EffectInstance, cx: &FxCtx, w: usize, h: usize) -> Option<Vec<FxOp>> {
+    if !e.enabled {
+        return Some(Vec::new());
+    }
+    if e.effect != "lumetri" {
+        return FxOp::eval(e, cx, w, h).filter(FxOp::gpu_ok).map(|op| vec![op]);
+    }
+    if !crate::effects::lumetri_bakeable(e, cx) {
+        return None;
+    }
+    let mut ops = Vec::with_capacity(4);
+    match crate::effects::lumetri_vignette(e, cx) {
+        None => ops.push(baked(e, cx, true, true)),
+        Some(p) => {
+            ops.push(baked(e, cx, true, false));
+            ops.push(FxOp::Vignette { p });
+            ops.push(baked(e, cx, false, true));
+        }
+    }
+    let sharpen = crate::effects::lumetri_sharpen(e, cx);
+    if sharpen.abs() > 1e-3 {
+        let r = crate::effects::lumetri_sharpen_radius(cx);
+        let (rx, ry) = gaussian_boxes(w, h, r, r);
+        ops.push(FxOp::Unsharp { rx, ry, amount: sharpen.max(-1.0), threshold: 0.0 });
+    }
+    ops.iter().all(FxOp::gpu_ok).then_some(ops)
+}
+
+/// Whether the preview can run `e` on the GPU (see [`gpu_ops`]).
+pub fn gpu_capable(e: &EffectInstance, cx: &FxCtx) -> bool {
+    match e.effect.as_str() {
+        "lumetri" => crate::effects::lumetri_bakeable(e, cx),
+        id => GPU_EFFECTS.contains(&id),
+    }
+}
+
+type BakeCache = Mutex<Vec<(u64, Arc<Lut3d>)>>;
+
+fn bake_cache() -> &'static BakeCache {
+    static C: OnceLock<BakeCache> = OnceLock::new();
+    C.get_or_init(Default::default)
+}
+
+/// Lumetri's Basic (`basic`) and / or Curves-Wheels-Look-HSL (`advanced`) stages baked over a
+/// 33³ lattice of display-encoded colours (cached per parameter values, time when animated, and
+/// the LUTs they use).
+fn baked(e: &EffectInstance, cx: &FxCtx, basic: bool, advanced: bool) -> FxOp {
+    use std::hash::{Hash, Hasher};
+    let mut hs = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_string(e).unwrap_or_default().hash(&mut hs);
+    (basic, advanced, format!("{:?}", cx.working)).hash(&mut hs);
+    if e.is_animated() {
+        cx.t.0.hash(&mut hs);
+    }
+    for id in ["input_lut", "look_lut"] {
+        let spec = e.param(id).map(|p| format!("{:?}", p.value)).unwrap_or_default();
+        let ptr = crate::luts::resolve(cx.project, crate::effects::text(e, id)).map(|l| Arc::as_ptr(&l) as usize);
+        (spec, ptr).hash(&mut hs);
+    }
+    let key = hs.finish();
+    if let Some((_, l)) = bake_cache().lock().unwrap_or_else(|p| p.into_inner()).iter().find(|(k, _)| *k == key) {
+        return FxOp::Lut3 { key, lut: l.clone() };
+    }
+    let n = BAKE_SIZE;
+    let m = (n - 1) as f32;
+    let mut img = Image::new(n * n, n);
+    for b in 0..n {
+        for g in 0..n {
+            for r in 0..n {
+                let c = dec([r as f32 / m, g as f32 / m, b as f32 / m]);
+                let i = (b * n * n + g * n + r) * 4;
+                img.px[i..i + 4].copy_from_slice(&[c[0], c[1], c[2], 1.0]);
+            }
+        }
+    }
+    crate::effects::lumetri_color(&mut img, e, cx, basic, false, advanced);
+    let data = img.px.as_chunks::<4>().0.iter().map(|p| [p[0], p[1], p[2]]).collect();
+    let lut = Arc::new(Lut3d { title: String::new(), size: n, domain_min: [0.0; 3], domain_max: [1.0; 3], data });
+    let mut c = bake_cache().lock().unwrap_or_else(|p| p.into_inner());
+    c.push((key, lut.clone()));
+    if c.len() > 24 {
+        c.remove(0);
+    }
+    FxOp::Lut3 { key, lut }
+}
 
 /// `Image::transformed` without the mip path: the destination rectangle it writes and the inverse.
 fn resample(w: usize, h: usize, m: &Affine, opacity: f32) -> Resample {
@@ -430,6 +540,8 @@ impl FxOp {
     pub fn gpu_ok(&self) -> bool {
         let fin = |v: &[f32]| v.iter().all(|x| x.is_finite());
         match self {
+            FxOp::Lut3 { lut, .. } => lut.size >= 2 && lut.data.iter().all(|c| fin(c)),
+            FxOp::Vignette { p } => fin(p),
             FxOp::BrightnessContrast { br, co } => fin(&[*br, *co]),
             FxOp::ProcAmp { br, co, hue, sat } => fin(&[*br, *co, *hue, *sat]),
             FxOp::Tint { black, white, amount } => fin(black) && fin(white) && amount.is_finite(),
@@ -467,6 +579,11 @@ impl FxOp {
             return;
         }
         match self {
+            FxOp::Lut3 { lut, .. } => img.map_rgb(|c, _, _| lut.apply(enc(c))),
+            FxOp::Vignette { p } => {
+                let (w, h) = (img.w as f32, img.h as f32);
+                img.map_rgb(|c, x, y| dec(crate::effects::vignette_px(enc(c), x as f32, y as f32, w, h, *p)));
+            }
             FxOp::BrightnessContrast { br, co } => {
                 let (br, co) = (*br, *co);
                 img.map_rgb(|c, _, _| {

@@ -197,7 +197,7 @@ pub(crate) fn render_seq_tracks(project: &Project, seq: &Sequence, t: Tick, opts
 
 /// Coverage of an adjustment layer's (Motion-transformed) frame in output pixels, or `None` when
 /// it covers the whole output.
-fn adjustment_region(seq: &Sequence, item: &TrackItem, project: &Project, mt: Tick, scale: f32, w: usize, h: usize) -> Option<Image> {
+pub(crate) fn adjustment_region(seq: &Sequence, item: &TrackItem, project: &Project, mt: Tick, scale: f32, w: usize, h: usize) -> Option<Image> {
     let size = source_size(project, item.item).unwrap_or((seq.settings.width, seq.settings.height));
     let motion = motion_matrix(seq, item, size, mt);
     let s = scale as f64;
@@ -631,6 +631,9 @@ mod tests;
 
 #[cfg(test)]
 mod lumetri_hdr_tests;
+
+#[cfg(test)]
+mod lumetri_gpu_tests;
 
 #[cfg(test)]
 #[path = "adjustment_tests.rs"]

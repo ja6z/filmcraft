@@ -6,10 +6,14 @@
 //! clip whose enabled standard effects all have a GPU implementation ([`crate::gpufx`]) carries
 //! them as a [`LayerFx`]: their parameters evaluated at the frame's time, run by the GPU on the
 //! clip's working image before Motion places it, in the CPU's order (effects → Motion → Opacity /
-//! blend). Anything the shaders don't cover yet — other standard effects, masks, adjustment
+//! blend). Lumetri runs as a baked LUT ([`crate::gpufx::gpu_ops`]). An adjustment layer of the
+//! top sequence whose effects the GPU covers (unmasked, covering the whole frame, not inside a
+//! transition) is an [`adjust`](PlanLayer::adjust) layer: its effects run on everything composited
+//! below it and the result is drawn over it with the layer's opacity and blend mode, as the CPU
+//! does. Anything the shaders don't cover yet — other standard effects, masks, other adjustment
 //! layers, nested sequences, non-dissolve transitions — is rendered on the CPU for that layer (or
-//! the whole frame) and handed over as a pre-composited image, so the GPU path is always exact
-//! with respect to the CPU reference.
+//! the whole frame) and handed over as a pre-composited image, so the GPU path matches the CPU
+//! reference (exactly, or within the LUT's interpolation for Lumetri).
 
 use std::sync::Arc;
 
@@ -34,6 +38,9 @@ pub struct PlanLayer {
     pub blend: Blend,
     /// Standard effects to run on the frame before it is placed (None: draw the frame directly).
     pub fx: Option<Arc<LayerFx>>,
+    /// An adjustment layer: `fx` runs on the picture composited so far (sized `fx.size`, the
+    /// output) instead of on `frame`, and the result is drawn over it at the identity matrix.
+    pub adjust: bool,
 }
 
 /// The GPU effect stage of a layer: the frame is decoded into a working image of `size` (the
@@ -49,7 +56,7 @@ pub struct LayerFx {
 impl PlanLayer {
     /// A layer drawing `frame` directly.
     pub fn new(frame: Arc<VideoFrame>, matrix: Affine, opacity: f32, blend: Blend) -> Self {
-        Self { frame, matrix, opacity, blend, fx: None }
+        Self { frame, matrix, opacity, blend, fx: None, adjust: false }
     }
 
     /// Size of the picture the matrix places: the working image with effects, else the frame.
@@ -94,7 +101,7 @@ fn gpu_chain<'a>(project: &Project, item: &'a TrackItem, opts: RenderOptions) ->
             continue;
         }
         let masked = e.masks.iter().any(|m| m.mode != filmcraft_project::MaskMode::None);
-        if masked || !crate::gpufx::GPU_EFFECTS.contains(&e.effect.as_str()) {
+        if masked || !(crate::gpufx::GPU_EFFECTS.contains(&e.effect.as_str()) || e.effect == "lumetri") {
             return None;
         }
         chain.push(e);
@@ -111,8 +118,8 @@ pub fn plan_frame(project: &Project, seq_id: ItemId, t: Tick, opts: RenderOption
     if !seq.settings.color.is_plain() || !seq.settings.composite_linear {
         return FramePlan::Image(crate::render_sequence(project, seq_id, t, opts, sources));
     }
-    // Whole-frame fallback: adjustment layers or complex transitions anywhere at t.
-    if !layered_at(project, seq, t) {
+    // Whole-frame fallback: adjustment layers the GPU can't run, or complex transitions, at t.
+    if !layered_at(project, seq, t, Some(opts)) {
         return FramePlan::Image(crate::render_sequence(project, seq_id, t, opts, sources));
     }
     let mut layers = Vec::new();
@@ -130,25 +137,65 @@ pub fn plan_frame(project: &Project, seq_id: ItemId, t: Tick, opts: RenderOption
     FramePlan::Layers { width: w, height: h, layers }
 }
 
-/// Whether the frame of `seq` at `t` can be planned as layers: no adjustment layer and no
-/// transition the compositor cannot mix itself is showing.
-fn layered_at(project: &Project, seq: &Sequence, t: Tick) -> bool {
+/// Whether the frame of `seq` at `t` can be planned as layers: no transition the compositor
+/// cannot mix itself, and no adjustment layer unless `adjust` (the top sequence's options) is
+/// given and the GPU can run it ([`adjustment_fx`]).
+fn layered_at(project: &Project, seq: &Sequence, t: Tick, adjust: Option<RenderOptions>) -> bool {
+    let is_adjustment = |it: &TrackItem| project.item(it.item).is_some_and(|p| matches!(p.kind, ItemKind::AdjustmentLayer { .. }));
     for tr in &seq.video_tracks {
         if !tr.enabled {
             continue;
         }
-        if let Some(trn) = tr.transitions.iter().find(|x| x.range().contains(t))
-            && !simple_transition(&trn.effect.effect)
-        {
-            return false;
+        if let Some(trn) = tr.transitions.iter().find(|x| x.range().contains(t)) {
+            let ends = [trn.from, trn.to].into_iter().flatten().filter_map(|id| tr.item(id));
+            if !simple_transition(&trn.effect.effect) || ends.into_iter().any(is_adjustment) {
+                return false;
+            }
         }
         if let Some(it) = tr.item_at(t)
-            && project.item(it.item).is_some_and(|p| matches!(p.kind, ItemKind::AdjustmentLayer { .. }))
+            && it.enabled
+            && is_adjustment(it)
+            && adjust.is_none_or(|opts| opts.effects && adjustment_fx(project, seq, it, t, opts).is_none())
         {
             return false;
         }
     }
     true
+}
+
+/// The GPU effect stage of adjustment layer `item` at `t`: its standard effects as ops over the
+/// whole output. None when the CPU must render it (masked effects or opacity masks, a Motion that
+/// moves its frame off the full picture, or an effect without a GPU implementation).
+fn adjustment_fx(project: &Project, seq: &Sequence, item: &TrackItem, t: Tick, opts: RenderOptions) -> Option<LayerFx> {
+    if item.has_opacity_masks() {
+        return None;
+    }
+    let mt = item.effect_time_at(t);
+    let (w, h) = output_size(seq, opts.scale);
+    if crate::adjustment_region(seq, item, project, mt, opts.scale, w, h).is_some() {
+        return None;
+    }
+    let cx = crate::effects::FxCtx {
+        t: mt,
+        px_scale: opts.scale,
+        seconds: (t - item.start).seconds(),
+        timecode: "",
+        clip_name: &item.name,
+        project: Some(project),
+        env: None,
+        working: seq.settings.color.working,
+    };
+    let mut ops = Vec::new();
+    for e in item.effects.iter().filter(|e| e.def().is_some_and(|d| !d.intrinsic) && !filmcraft_project::graphic::is_layer(e)) {
+        if !e.enabled {
+            continue;
+        }
+        if e.masks.iter().any(|m| m.mode != filmcraft_project::MaskMode::None) {
+            return None;
+        }
+        ops.extend(crate::gpufx::gpu_ops(e, &cx, w, h)?);
+    }
+    Some(LayerFx { size: (w as u32, h as u32), decimation: 1, ops })
 }
 
 /// Push the layers of every video track of `seq` at `t`, bottom track first (`seq` must be
@@ -189,6 +236,18 @@ fn push_tracks(project: &Project, seq: &Sequence, t: Tick, opts: RenderOptions, 
         if !item.enabled {
             continue;
         }
+        if project.item(item.item).is_some_and(|p| matches!(p.kind, ItemKind::AdjustmentLayer { .. })) {
+            // (only the top sequence plans adjustment layers; see `layered_at`)
+            if nest == 0
+                && opts.effects
+                && let Some(fx) = adjustment_fx(project, seq, item, t, opts)
+            {
+                let (op, bl) = crate::opacity_blend(item, item.effect_time_at(t));
+                let blank = Arc::new(VideoFrame::rgba_f32(1, 1, vec![0.0; 4]));
+                layers.push(PlanLayer { frame: blank, matrix: Affine::IDENTITY, opacity: op, blend: bl, fx: Some(Arc::new(fx)), adjust: true });
+            }
+            continue;
+        }
         push_item(project, seq, item, t, opts, sources, 1.0, None, nest, layers);
     }
 }
@@ -202,7 +261,7 @@ fn nest_is_plain(project: &Project, seq: &Sequence, nested: &Sequence, ft: Tick)
     nested.settings.color == seq.settings.color
         && nested.settings.composite_linear
         && (nested.settings.width, nested.settings.height) == (seq.settings.width, seq.settings.height)
-        && layered_at(project, nested, ft)
+        && layered_at(project, nested, ft, None)
         && nested.video_tracks.iter().filter(|tr| tr.enabled).all(|tr| {
             tr.transitions.iter().any(|x| x.range().contains(ft))
                 || tr.item_at(ft).filter(|i| i.enabled).is_none_or(|i| crate::opacity_blend(i, i.effect_time_at(ft)).1 == Blend::Normal)
@@ -318,13 +377,13 @@ fn push_item(
                 env: None,
                 working: seq.settings.color.working,
             };
-            let ops: Option<Vec<FxOp>> = chain.iter().map(|e| FxOp::eval(e, &cx, lw, lh).filter(FxOp::gpu_ok)).collect();
+            let ops: Option<Vec<FxOp>> = chain.iter().map(|e| crate::gpufx::gpu_ops(e, &cx, lw, lh)).collect::<Option<Vec<_>>>().map(|v| v.concat());
             if let Some(ops) = ops {
                 let m = Affine::scale(opts.scale as f64, opts.scale as f64)
                     .then_apply(&motion)
                     .then_apply(&Affine::scale(1.0 / px_scale as f64, 1.0 / px_scale as f64));
                 let fx = LayerFx { size: (lw as u32, lh as u32), decimation: n as u32, ops };
-                out.push(PlanLayer { frame, matrix: m, opacity: op * extra_opacity, blend: bl, fx: Some(Arc::new(fx)) });
+                out.push(PlanLayer { frame, matrix: m, opacity: op * extra_opacity, blend: bl, fx: Some(Arc::new(fx)), adjust: false });
                 return;
             }
         } else if plain {
@@ -372,6 +431,15 @@ pub fn execute_cpu(plan: &FramePlan) -> crate::Image {
         FramePlan::Layers { width, height, layers } => {
             let mut canvas = crate::Image::new(*width, *height);
             for l in layers {
+                if l.adjust {
+                    // an adjustment layer: its effects on everything below, drawn over it
+                    let mut adj = canvas.clone();
+                    for op in l.fx.iter().flat_map(|fx| &fx.ops) {
+                        op.apply(&mut adj);
+                    }
+                    crate::blend::composite(&mut canvas, &adj, l.opacity, l.blend);
+                    continue;
+                }
                 let src = match &l.fx {
                     Some(fx) => effect_image(&l.frame, fx),
                     None => crate::Image { w: l.frame.width as usize, h: l.frame.height as usize, px: l.frame.to_linear_f32() },

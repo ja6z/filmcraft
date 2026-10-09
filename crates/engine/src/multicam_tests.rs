@@ -192,6 +192,22 @@ fn audio_sync_multicam_sample_accurate() {
 }
 
 #[test]
+fn an_audio_only_reference_keeps_the_cameras_frame_size_and_rate() {
+    // a music video: the cameras are synced to the master audio, which has no picture
+    let Some((a, b, rec)) = fixtures() else { return };
+    let mut s = Session::default();
+    let items = import(&mut s, &[&a, &b, &rec]);
+    let r = on_items(&mut s, "clip.createMulticam", &items, json!({"method": "audio", "reference": items[2].0})).unwrap();
+    let q = s.project.sequence(ItemId(r["sequence"].as_u64().unwrap())).unwrap().clone();
+    assert_eq!((q.settings.width, q.settings.height), (320, 180), "the cameras' frame size, not the default");
+    assert_eq!(q.settings.frame_rate, FrameRate::FPS_24);
+    // still synced to the reference: the recorder and camera A play event sample m together
+    let m = 300_000;
+    let d = (event_time(find_clip(&q, items[2], false), START_REC, m) - event_time(find_clip(&q, items[0], false), START_A, m)).abs();
+    assert!(d <= SAMPLE, "{} samples apart", d.0 as f64 / SAMPLE.0 as f64);
+}
+
+#[test]
 fn timecode_marker_and_in_point_sync_within_one_frame() {
     let Some((a, b, _)) = fixtures() else { return };
     let mut s = Session::default();

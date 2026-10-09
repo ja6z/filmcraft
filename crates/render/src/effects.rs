@@ -44,7 +44,7 @@ pub(crate) fn b(e: &EffectInstance, id: &str) -> bool {
 fn on(e: &EffectInstance, id: &str) -> bool {
     e.param(id).and_then(|p| p.value.as_bool()).unwrap_or(true)
 }
-fn text<'e>(e: &'e EffectInstance, id: &str) -> &'e str {
+pub(crate) fn text<'e>(e: &'e EffectInstance, id: &str) -> &'e str {
     match e.param(id).map(|p| &p.value) {
         Some(ParamValue::Text(s)) => s,
         _ => "",
@@ -595,7 +595,70 @@ fn within_unit(v: [f32; 3], hdr: bool, f: impl Fn([f32; 3]) -> [f32; 3]) -> [f32
 }
 
 fn lumetri(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
-    let (basic_on, creative_on, vignette_on) = (on(e, "basic_on"), on(e, "creative_on"), on(e, "vignette_on"));
+    lumetri_basic(img, e, cx, true);
+    lumetri_advanced(img, e, cx);
+    hsl_secondary(img, e, cx);
+    let sharpen = lumetri_sharpen(e, cx);
+    if sharpen.abs() > 1e-3 {
+        unsharp(img, lumetri_sharpen_radius(cx), sharpen.max(-1.0), 0.0);
+    }
+}
+
+/// Lumetri ▸ Creative ▸ Sharpen amount (−1 … 1; 0 off).
+pub(crate) fn lumetri_sharpen(e: &EffectInstance, cx: &FxCtx) -> f32 {
+    if on(e, "creative_on") { f(e, "sharpen", cx) / 100.0 } else { 0.0 }
+}
+
+/// Radius of Lumetri's sharpen blur at the render scale.
+pub(crate) fn lumetri_sharpen_radius(cx: &FxCtx) -> f32 {
+    1.2 * cx.px_scale.max(0.35)
+}
+
+/// Lumetri ▸ Vignette as (amount, midpoint, roundness, feather), None when off or neutral.
+pub(crate) fn lumetri_vignette(e: &EffectInstance, cx: &FxCtx) -> Option<[f32; 4]> {
+    let va = if on(e, "vignette_on") { f(e, "vignette_amount", cx) } else { 0.0 };
+    (va.abs() > 1e-4).then(|| [va, f(e, "vignette_midpoint", cx) / 100.0, f(e, "vignette_roundness", cx) / 100.0, f(e, "vignette_feather", cx) / 100.0])
+}
+
+/// Lumetri's vignette on a display-encoded value at `(x, y)` of a `w`×`h` image.
+#[inline]
+pub(crate) fn vignette_px(v: [f32; 3], x: f32, y: f32, w: f32, h: f32, p: [f32; 4]) -> [f32; 3] {
+    let [va, vmid, vround, vfeather] = p;
+    let aspect = w / h;
+    let nx = (x / w - 0.5) * 2.0 * (1.0 + vround * 0.0) * if vround < 0.0 { aspect.powf(-vround) } else { 1.0 };
+    let ny = (y / h - 0.5) * 2.0;
+    let d = (nx * nx + ny * ny).sqrt() / std::f32::consts::SQRT_2;
+    let edge = ((d - vmid * 0.9) / (vfeather.max(0.01) * 0.9)).clamp(0.0, 1.0);
+    let e2 = edge * edge * (3.0 - 2.0 * edge);
+    let k = 1.0 + va * 0.2 * e2;
+    v.map(|q| if va < 0.0 { q * k.max(0.0) } else { q + (1.0 - q) * (k - 1.0) })
+}
+
+/// Whether Lumetri's colour stages are a pure per-pixel function the preview can bake into a 3D
+/// LUT ([`crate::gpufx`]): an SDR grade, and an HSL Secondary key without Denoise / Blur (which
+/// look at neighbouring pixels).
+pub(crate) fn lumetri_bakeable(e: &EffectInstance, cx: &FxCtx) -> bool {
+    if grade_space(e, cx, "hdr_white").is_hdr() || grade_space(e, cx, "curves_hdr_range").is_hdr() {
+        return false;
+    }
+    !(on(e, "hsl_on") && (f(e, "hsl_denoise", cx) > 0.0 || f(e, "hsl_blur", cx) > 0.0))
+}
+
+/// Lumetri's colour stages on `img`: the Basic / Creative stage (`basic`, with the vignette when
+/// `vignette`) and the Curves / Wheels / Look / HSL stage (`advanced`).
+pub(crate) fn lumetri_color(img: &mut Image, e: &EffectInstance, cx: &FxCtx, basic: bool, vignette: bool, advanced: bool) {
+    if basic {
+        lumetri_basic(img, e, cx, vignette);
+    }
+    if advanced {
+        lumetri_advanced(img, e, cx);
+        hsl_secondary(img, e, cx);
+    }
+}
+
+/// Basic Correction and the Creative sliders (and the vignette when `with_vignette`).
+fn lumetri_basic(img: &mut Image, e: &EffectInstance, cx: &FxCtx, with_vignette: bool) {
+    let (basic_on, creative_on, vignette_on) = (on(e, "basic_on"), on(e, "creative_on"), on(e, "vignette_on") && with_vignette);
     let input_lut = if basic_on { crate::luts::resolve(cx.project, text(e, "input_lut")) } else { None };
     let bf = |id: &str| if basic_on { f(e, id, cx) } else { 0.0 };
     // HDR: the sliders work on the PQ / HLG signal normalised to HDR White (cd/m²)
@@ -619,10 +682,8 @@ fn lumetri(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
     let vmid = f(e, "vignette_midpoint", cx) / 100.0;
     let vround = f(e, "vignette_roundness", cx) / 100.0;
     let vfeather = f(e, "vignette_feather", cx) / 100.0;
-    let sharpen = if creative_on { f(e, "sharpen", cx) / 100.0 } else { 0.0 };
     let gains = [1.0 + 0.35 * temp, 1.0 - 0.3 * tint, 1.0 - 0.35 * temp];
     let (w, h) = (img.w as f32, img.h as f32);
-    let aspect = w / h;
     img.map_rgb(|c, x, y| {
         let c = match &input_lut {
             Some(l) => gs.decode(within_unit(gs.encode(c), hdr, |v| l.apply(v))),
@@ -679,21 +740,10 @@ fn lumetri(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
         v = v.map(|q| l3 + (q - l3) * s);
         // vignette
         if va.abs() > 1e-4 {
-            let nx = (x as f32 / w - 0.5) * 2.0 * (1.0 + vround * 0.0) * if vround < 0.0 { aspect.powf(-vround) } else { 1.0 };
-            let ny = (y as f32 / h - 0.5) * 2.0;
-            let d = (nx * nx + ny * ny).sqrt() / std::f32::consts::SQRT_2;
-            let edge = ((d - vmid * 0.9) / (vfeather.max(0.01) * 0.9)).clamp(0.0, 1.0);
-            let e2 = edge * edge * (3.0 - 2.0 * edge);
-            let k = 1.0 + va * 0.2 * e2;
-            v = v.map(|q| if va < 0.0 { q * k.max(0.0) } else { q + (1.0 - q) * (k - 1.0) });
+            v = vignette_px(v, x as f32, y as f32, w, h, [va, vmid, vround, vfeather]);
         }
         gs.decode(v)
     });
-    lumetri_advanced(img, e, cx);
-    hsl_secondary(img, e, cx);
-    if sharpen.abs() > 1e-3 {
-        unsharp(img, 1.2 * cx.px_scale.max(0.35), sharpen.max(-1.0), 0.0);
-    }
 }
 
 // ---------- blur kernels ----------
