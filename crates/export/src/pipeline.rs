@@ -66,6 +66,7 @@ pub(crate) struct Pipeline {
     overlay: Option<Image>,
     start_tc: i64,
     drop_frame: bool,
+    renderer: Option<std::sync::Arc<dyn filmcraft_render::FrameRenderer>>,
 }
 
 impl Pipeline {
@@ -97,14 +98,24 @@ impl Pipeline {
             out_tf,
             effects,
             overlay,
+            renderer: if hdr_out { None } else { settings.renderer.as_ref().map(|r| r.0.clone()) },
         })
+    }
+
+    /// Frames render through a [`filmcraft_render::FrameRenderer`] (the GPU): one at a time, in
+    /// order, so each source decodes forwards instead of every thread seeking its own frame.
+    pub fn sequential(&self) -> bool {
+        self.renderer.is_some()
     }
 
     /// Output frame `f` as straight sRGB RGBA8 at the output size, or for HDR exports the encoded
     /// R'G'B' floats (3 per pixel).
     pub fn frame(&self, f: i64, sources: &dyn SourceProvider) -> (Vec<u8>, Vec<f32>) {
         let t = self.rate.tick_of(f);
-        let img = filmcraft_render::render_sequence(&self.project, self.seq, t, self.opts, sources);
+        let img = match &self.renderer {
+            Some(r) => r.render(&self.project, self.seq, t, self.opts, sources),
+            None => filmcraft_render::render_sequence(&self.project, self.seq, t, self.opts, sources),
+        };
         let mut img = self.place(img);
         self.overlays(&mut img, t);
         let lim = &self.effects.video_limiter;

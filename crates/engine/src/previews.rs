@@ -475,6 +475,7 @@ pub fn render(s: &mut Session, mode: RenderMode, p: &Value) -> Result<Value> {
     job.progress.total.store(frames.max(1) as u64, Ordering::Relaxed);
     let project = s.project.clone();
     // Previews are cached by content and reused with proxies on or off: always full resolution.
+    let renderer = crate::export_tools::export_renderer(s);
     let provider = s.media.full_res_provider(project.clone(), s.services.clone());
     let (prog, res) = (job.progress.clone(), job.result.clone());
     let nseg = todo.len();
@@ -504,6 +505,7 @@ pub fn render(s: &mut Session, mode: RenderMode, p: &Value) -> Result<Value> {
                 part_of_batch: true,
                 // previews stand in for the monitor picture: display-referred SDR
                 sdr: true,
+                renderer: renderer.clone(),
                 ..Default::default()
             };
             match filmcraft_export::export(&project, seq, &settings, &provider, &prog) {

@@ -334,6 +334,9 @@ pub struct Session {
     pub journal: Vec<(String, Value)>,
     /// Background jobs (exports, render previews…).
     pub jobs: Vec<Job>,
+    /// Renders export and render-preview frames on the GPU when the host has one (the desktop app
+    /// and the CLI set it) and the project's renderer is GPU; None: the CPU renders them.
+    pub frame_renderer: Option<Arc<dyn filmcraft_render::FrameRenderer>>,
     /// User preferences (`prefs.*` commands) and where they persist (None = not persisted).
     pub prefs: autosave::Preferences,
     pub prefs_path: Option<std::path::PathBuf>,
@@ -442,6 +445,7 @@ impl Session {
             events: Vec::new(),
             journal: Vec::new(),
             jobs: Vec::new(),
+            frame_renderer: None,
             prefs: Default::default(),
             prefs_path: None,
             persistence: None,

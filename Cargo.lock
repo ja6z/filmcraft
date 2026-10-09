@@ -1768,14 +1768,18 @@ dependencies = [
  "filmcraft-automation",
  "filmcraft-codecs",
  "filmcraft-engine",
+ "filmcraft-gpu",
  "filmcraft-media",
  "filmcraft-mpegts",
  "filmcraft-mxf",
  "filmcraft-ogg",
  "filmcraft-platform",
+ "filmcraft-render",
  "filmcraft-time",
+ "pollster 0.4.0",
  "serde_json",
  "tokio",
+ "wgpu",
 ]
 
 [[package]]

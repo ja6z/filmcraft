@@ -280,6 +280,10 @@ pub struct ExportSettings {
     /// writing `path` (hosts without a filesystem: the web app offers the file as a download).
     #[serde(skip)]
     pub sink: Option<OutputSink>,
+    /// Render the frames with this renderer (the GPU) instead of the CPU's `render_sequence`
+    /// (SDR exports; HDR output always renders on the CPU).
+    #[serde(skip)]
+    pub renderer: Option<FrameRendererRef>,
 }
 
 /// Receives in-memory export output: `(path, bytes)` per finished file.
@@ -289,6 +293,16 @@ pub struct OutputSink(pub Arc<dyn Fn(&str, Vec<u8>) -> std::io::Result<()> + Sen
 impl std::fmt::Debug for OutputSink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("OutputSink")
+    }
+}
+
+/// A frame renderer handed to an export ([`ExportSettings::renderer`]).
+#[derive(Clone)]
+pub struct FrameRendererRef(pub Arc<dyn filmcraft_render::FrameRenderer>);
+
+impl std::fmt::Debug for FrameRendererRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FrameRenderer")
     }
 }
 
@@ -447,6 +461,7 @@ impl Default for ExportSettings {
             h264_pass: H264Pass::Single,
             signal: ColorSignal::default(),
             sink: None,
+            renderer: None,
         }
     }
 }

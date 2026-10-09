@@ -43,6 +43,7 @@ pub mod lut;
 pub mod mask;
 pub use lut::GpuLut;
 pub use mask::GpuMask;
+pub use wgpu;
 
 /// Output texture format: gamma-encoded RGBA8 (what egui expects of native textures); the resolve
 /// shader applies the sRGB encoding.
@@ -98,6 +99,28 @@ fn tex_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
         },
         count: None,
     }
+}
+
+/// IEEE half → f32 (the accumulator's texels).
+pub fn f16_to_f32(h: u16) -> f32 {
+    let s = ((h >> 15) & 1) as u32;
+    let e = ((h >> 10) & 0x1f) as u32;
+    let m = (h & 0x3ff) as u32;
+    let bits = match (e, m) {
+        (0, 0) => s << 31,
+        (0, _) => {
+            // subnormal: normalise the mantissa
+            let (mut e2, mut m2) = (127 - 15 + 1, m);
+            while m2 & 0x400 == 0 {
+                m2 <<= 1;
+                e2 -= 1;
+            }
+            (s << 31) | (e2 << 23) | ((m2 & 0x3ff) << 13)
+        }
+        (31, _) => (s << 31) | 0x7f80_0000 | (m << 13),
+        _ => (s << 31) | ((e + 127 - 15) << 23) | (m << 13),
+    };
+    f32::from_bits(bits)
 }
 
 /// f32 → IEEE half (round to nearest even), no dependency needed.
@@ -885,6 +908,49 @@ impl GpuCompositor {
         Some((w, h, out))
     }
 
+    /// The last composite before the display pass: the accumulator as linear premultiplied RGBA
+    /// f32 (what `filmcraft_render::render_sequence` returns for the same frame).
+    pub fn read_accum(&self) -> Option<(u32, u32, Vec<f32>)> {
+        let (tex, _, (w, h)) = self.accum.as_ref()?;
+        let row = (w * 8).div_ceil(256) * 256;
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback-accum"),
+            size: (row * h) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo { texture: tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(*h) } },
+            wgpu::Extent3d { width: *w, height: *h, depth_or_array_layers: 1 },
+        );
+        self.queue.submit([enc.finish()]);
+        let slice = buf.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        rx.recv().ok()?.ok()?;
+        let data = slice.get_mapped_range().ok()?;
+        let mut out = vec![0f32; (w * h * 4) as usize];
+        out.par_chunks_mut((w * 4) as usize).enumerate().for_each(|(y, dst)| {
+            let src = &data[y * row as usize..y * row as usize + (w * 8) as usize];
+            for (d, s) in dst.iter_mut().zip(src.as_chunks::<2>().0) {
+                *d = f16_to_f32(u16::from_le_bytes(*s));
+            }
+        });
+        drop(data);
+        buf.unmap();
+        Some((*w, *h, out))
+    }
+
+    /// Whether this device runs the effect stage (effects, Lumetri and adjustment layers on the GPU).
+    pub fn has_effect_stage(&self) -> bool {
+        self.fx.is_some()
+    }
+
     /// Read the output back as RGBA8 (tests / screenshots / thumbnails).
     pub fn read_output(&self) -> Option<(u32, u32, Vec<u8>)> {
         let (tex, _, (w, h)) = self.output.as_ref()?;
@@ -975,3 +1041,46 @@ mod blend_tests;
 mod fx_tests;
 #[cfg(test)]
 mod tests;
+
+/// Renders export and render-preview frames on the GPU ([`filmcraft_render::FrameRenderer`]): the
+/// frame is planned (its sources decoded) and its texels prepared on the calling thread — export
+/// frames are rendered in parallel — then composited and the accumulator read back, one frame at
+/// a time. Frames the plan doesn't layer come back from the CPU as before.
+pub struct GpuFrameRenderer {
+    comp: std::sync::Mutex<GpuCompositor>,
+}
+
+impl GpuFrameRenderer {
+    /// A renderer on `device`, or None when it can't run the effect stage (the CPU render keeps
+    /// exports exact there).
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Option<Self> {
+        let comp = GpuCompositor::new(device, queue);
+        comp.has_effect_stage().then(|| Self { comp: std::sync::Mutex::new(comp) })
+    }
+}
+
+impl filmcraft_render::FrameRenderer for GpuFrameRenderer {
+    fn render(
+        &self,
+        project: &filmcraft_project::Project,
+        seq: filmcraft_project::ItemId,
+        t: filmcraft_time::Tick,
+        opts: filmcraft_render::RenderOptions,
+        sources: &dyn filmcraft_render::SourceProvider,
+    ) -> filmcraft_render::Image {
+        let plan = filmcraft_render::plan::plan_frame(project, seq, t, opts, sources);
+        if let FramePlan::Image(img) = plan {
+            return img;
+        }
+        let prep = prepare(&plan);
+        let read = {
+            let mut c = self.comp.lock().unwrap_or_else(|p| p.into_inner());
+            c.composite_prepared(&plan, Some(&prep));
+            c.read_accum()
+        };
+        match read {
+            Some((w, h, px)) => filmcraft_render::Image { w: w as usize, h: h as usize, px },
+            None => filmcraft_render::render_sequence(project, seq, t, opts, sources),
+        }
+    }
+}

@@ -27,7 +27,7 @@ SUBCOMMANDS
   inspect [project|sequence]    project tree or active sequence as JSON (default: both)
   import <file>...              import media into the project
   export <out> [--preset name] [--format f] [--range r] [--start s --end s] [--settings json]
-         [--scale f] [--quality 0-100] [--no-audio] [--queue]
+         [--scale f] [--quality 0-100] [--no-audio] [--queue] [--cpu]
                                 export the active sequence and wait for it to finish: with an
                                 export preset (`export --list-presets`; built-in or the user's), or
                                 a format (h264|prores|dnxhr|apv|mjpeg|mxf-op1a|mxf-opatom|png|tiff|bmp|gif|wav|aiff, guessed
@@ -36,7 +36,8 @@ SUBCOMMANDS
                                 preset; --scale renders at a fraction of the frame size (0.5 =
                                 half); --quality 0-100 for the formats that take one; --no-audio
                                 leaves the sound out; --queue adds to the export queue and runs it
-                                instead
+                                instead; frames render on the GPU (--cpu, or the project's
+                                Software Only renderer: on the CPU)
   export --list-presets [query] list export presets (name, category, format) as JSON
   render --seconds S --out f.png [--scale 0.5]   render one Program frame to PNG
   probe <media> [--image-sequence]
@@ -81,6 +82,20 @@ fn fail(msg: impl std::fmt::Display) -> ! {
 enum Backend {
     Local(Box<Session>),
     Bridge(BridgeClient),
+}
+
+/// A GPU frame renderer on the system's default adapter (None without a GPU that runs the
+/// compositor's effect stage: exports then render on the CPU).
+fn gpu_renderer() -> Option<std::sync::Arc<dyn filmcraft_render::FrameRenderer>> {
+    use filmcraft_gpu::wgpu;
+    let instance = wgpu::Instance::default();
+    let adapter = pollster::block_on(
+        instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() }),
+    )
+    .ok()?;
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()?;
+    let r = filmcraft_gpu::GpuFrameRenderer::new(&device, &queue)?;
+    Some(std::sync::Arc::new(r))
 }
 
 impl Backend {
@@ -325,6 +340,15 @@ async fn main() {
                 p["audio"] = json!(false);
             }
             let mut b = Backend::open(&a);
+            // render on the GPU (Metal) unless --cpu or the project's renderer is Software Only
+            if let Backend::Local(s) = &mut b
+                && !a.flag("--cpu")
+            {
+                s.frame_renderer = gpu_renderer();
+                if s.frame_renderer.is_none() {
+                    eprintln!("export: no GPU adapter, rendering on the CPU");
+                }
+            }
             let t0 = std::time::Instant::now();
             let r = if a.flag("--queue") {
                 let mut q = p.clone();

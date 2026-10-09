@@ -14,6 +14,8 @@ filmcraft-color = { workspace = true }
 filmcraft-frame = { workspace = true }
 filmcraft-geom = { workspace = true }
 filmcraft-render = { workspace = true }
+filmcraft-project = { workspace = true }
+filmcraft-time = { workspace = true }
 wgpu = { version = "30", default-features = false, features = ["wgsl"] }
 log = { workspace = true }
 rayon = { workspace = true }
@@ -22,5 +24,3 @@ rayon = { workspace = true }
 pollster = "0.4"
 wgpu = { version = "30", features = ["wgsl", "metal", "vulkan", "dx12", "gles"] }
 filmcraft-media = { workspace = true }
-filmcraft-project = { workspace = true }
-filmcraft-time = { workspace = true }

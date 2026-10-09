@@ -286,6 +286,9 @@ impl FilmcraftApp {
         match made {
             Ok(compositor) if !broken.load(std::sync::atomic::Ordering::Relaxed) => {
                 let max_texture = rs.device.limits().max_texture_dimension_2d;
+                // exports and render previews render on the same GPU (Project Settings ▸ Renderer)
+                self.session.frame_renderer = filmcraft_gpu::GpuFrameRenderer::new(&rs.device, &rs.queue)
+                    .map(|r| std::sync::Arc::new(r) as std::sync::Arc<dyn filmcraft_render::FrameRenderer>);
                 self.gpu = Some(GpuState { render_state: rs, compositor, texture: None, last_key: None, size: (0, 0), last_ms: 0.0, broken, max_texture });
             }
             _ => log::error!("GPU compositor failed to initialise; compositing on the CPU"),

@@ -357,7 +357,17 @@ fn write_sidecar(s: &Session, project: &Project, seq: ItemId, settings: &ExportS
 }
 
 /// Run an export of `seq` in `project` as a background job (or now, with `wait`); returns the job id.
+/// The renderer exports and render previews use: the host's GPU renderer unless the project's
+/// renderer is Software Only (Project Settings ▸ General ▸ Renderer).
+pub fn export_renderer(s: &Session) -> Option<filmcraft_export::FrameRendererRef> {
+    let r = s.frame_renderer.as_ref()?;
+    (s.project.settings.renderer != crate::project_tools::RENDERER_SOFTWARE).then(|| filmcraft_export::FrameRendererRef(r.clone()))
+}
+
 pub fn spawn_export(s: &mut Session, project: Arc<Project>, seq: ItemId, mut settings: ExportSettings, label: String, wait: bool) -> Result<u64> {
+    if settings.renderer.is_none() {
+        settings.renderer = export_renderer(s);
+    }
     let format = settings.format;
     if !filmcraft_export::available(format) {
         return Err(EngineError::Other(format!("{} export is not available (no encoder registered)", format.label())));

@@ -626,6 +626,14 @@ file.exportMedia {path, preset?, settings?, format?, range?, …}     export.qui
 | `png`, `tiff`, `bmp` | `image` | numbered stills `<name>000.<ext>`, `<name>001.<ext>` … |
 | `gif`, `wav`, `aiff` | built in / `image` | GIF / RIFF WAVE (`WAVE_FORMAT_EXTENSIBLE` for 5.1) / AIFF (16- or 24-bit PCM) |
 
+- **GPU rendering.** Exports and render previews take their frames from the host's
+  `render::FrameRenderer` when there is one (`Session::frame_renderer`, `ExportSettings::renderer`):
+  `gpu::GpuFrameRenderer` plans each frame (`plan_frame`) and composites it on the GPU — the app
+  shares the monitor's wgpu device, `filmcraft-cli export` opens the default adapter (`--cpu` skips
+  it). Frames planned for the CPU, HDR exports and the project's **Software Only** renderer use
+  `render_sequence`. Through the GPU, frames render one at a time in order (sources decode forwards;
+  the encoder still runs in parallel). The GPU frame matches the CPU one within 8-bit rounding
+  (`ui-egui/tests/gpu_export.rs`, ≥ 38 dB, typically 55–99 dB).
 - **Reproducible.** The same project and settings give the same file on every machine. Frames render
   in batches of one per core, but the muxer gets them in fixed groups of 16 output frames
   (`INTERLEAVE` in `crates/export/src/job.rs`), each followed by its audio, and H.264 uses one slice

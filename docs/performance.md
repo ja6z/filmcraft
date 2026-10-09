@@ -33,6 +33,21 @@ app does on its frame workers.
 paused resolution and proxies in one choice — Auto (adapts ¼ … Full to the frames playback drops),
 Smooth (¼ / ½, proxies), Balanced (½ / Full, proxies), High Quality (Full, original media).
 
+## Results (GPU4: exports render on the GPU)
+
+The same project, 3 s exported with the High Quality 2160p 4K preset (H.264 VBR 60 Mbps) by
+`filmcraft-cli export --start 50 --end 53` on an Apple M2:
+
+| | wall time | CPU time | per frame (render) |
+|---|---|---|---|
+| CPU render (`--cpu`, frames in parallel) | 46 s | — | 424 ms (`project_bench`, full resolution) |
+| GPU render (`GpuFrameRenderer`, frames in order) | 19.3 s | 89 s | 58 ms |
+
+The two files differ by 46 dB PSNR (8-bit rounding of the GPU's half-float accumulator). What is
+left is mostly the H.264 encoder (~65 % of samples: motion search, SATD, CABAC); decoding is
+VideoToolbox. Rendering the GPU frames in parallel was slower (63 s): every rayon thread seeked
+its own frame in the long-GOP HEVC sources.
+
 ## Memory of clips on a timeline (MEM1–MEM3)
 
 Measured on the desktop release build with `footprint`, `heap` and `malloc_history`

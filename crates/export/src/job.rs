@@ -298,7 +298,11 @@ impl Exporter {
         if self.next < self.f1 {
             let (f, end) = (self.next, (self.next + self.batch).min(self.f1));
             let pipe = &self.pipe;
-            let frames: Vec<(Vec<u8>, Vec<f32>)> = (f..end).into_par_iter().map(|fi| pipe.frame(fi, sources)).collect();
+            let frames: Vec<(Vec<u8>, Vec<f32>)> = if pipe.sequential() {
+                (f..end).map(|fi| pipe.frame(fi, sources)).collect()
+            } else {
+                (f..end).into_par_iter().map(|fi| pipe.frame(fi, sources)).collect()
+            };
             if self.first_pass {
                 if filmcraft_media::pending::take() {
                     return Ok(Step::Pending);

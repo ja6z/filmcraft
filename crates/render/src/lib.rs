@@ -88,6 +88,14 @@ pub fn output_size(seq: &Sequence, scale: f32) -> (usize, usize) {
     (((seq.settings.width as f32 * scale).round() as usize).max(1), ((seq.settings.height as f32 * scale).round() as usize).max(1))
 }
 
+/// Renders sequence frames for an export or a render preview. Without one the CPU
+/// [`render_sequence`] does; a host with a GPU hands over one that plans each frame and
+/// composites it on the GPU (`filmcraft_gpu::GpuFrameRenderer`). It returns what
+/// `render_sequence` returns: linear premultiplied RGBA at `opts.scale`, display-converted.
+pub trait FrameRenderer: Send + Sync {
+    fn render(&self, project: &Project, seq: ItemId, t: Tick, opts: RenderOptions, sources: &dyn SourceProvider) -> Image;
+}
+
 /// Render sequence `seq_id` at timeline time `t`.
 pub fn render_sequence(project: &Project, seq_id: ItemId, t: Tick, opts: RenderOptions, sources: &dyn SourceProvider) -> Image {
     let Some(seq) = project.sequence(seq_id) else { return Image::new(1, 1) };

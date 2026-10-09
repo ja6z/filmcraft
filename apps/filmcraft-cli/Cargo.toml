@@ -19,6 +19,10 @@ whisper = ["filmcraft-engine/whisper", "filmcraft-engine/speech-download"]
 
 [dependencies]
 filmcraft-engine = { workspace = true }
+filmcraft-gpu = { workspace = true }
+filmcraft-render = { workspace = true }
+pollster = "0.4"
+wgpu = { version = "30", default-features = false, features = ["wgsl", "metal", "vulkan", "dx12"] }
 filmcraft-media = { workspace = true }
 filmcraft-codecs = { workspace = true }
 filmcraft-platform = { workspace = true }
