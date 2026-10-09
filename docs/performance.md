@@ -42,10 +42,12 @@ The same project, 3 s exported with the High Quality 2160p 4K preset (H.264 VBR 
 |---|---|---|---|
 | CPU render (`--cpu`, frames in parallel) | 46 s | — | 424 ms (`project_bench`, full resolution) |
 | GPU render (`GpuFrameRenderer`, frames in order) | 19.3 s | 89 s | 58 ms |
+| GPU render + VideoToolbox H.264 (Hardware Encoding) | 10.0 s | 19 s | 58 ms |
 
-The two files differ by 46 dB PSNR (8-bit rounding of the GPU's half-float accumulator). What is
-left is mostly the H.264 encoder (~65 % of samples: motion search, SATD, CABAC); decoding is
-VideoToolbox. Rendering the GPU frames in parallel was slower (63 s): every rayon thread seeked
+The two files differ by 46 dB PSNR (8-bit rounding of the GPU's half-float accumulator). What was
+left was mostly our H.264 encoder (~65 % of samples: motion search, SATD, CABAC); decoding is
+VideoToolbox. With Performance ▸ Hardware Encoding (VideoToolbox H.264, the default) the same
+export takes **10.0 s** (19 s of CPU time) — 4.6× the CPU render with our encoder. Rendering the GPU frames in parallel was slower (63 s): every rayon thread seeked
 its own frame in the long-GOP HEVC sources.
 
 ## Memory of clips on a timeline (MEM1–MEM3)

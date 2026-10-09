@@ -1,7 +1,9 @@
-//! OS media integration (layer L5): hardware video decoding through the operating system's codecs.
+//! OS media integration (layer L5): hardware video decoding and encoding through the operating
+//! system's codecs.
 //!
 //! [`register`] puts the platform's hardware decoder factory in front of FilmCraft's own decoders
-//! (`filmcraft_codecs::register_video_decoder`). Today that is VideoToolbox on macOS for H.264
+//! (`filmcraft_codecs::register_video_decoder`), and its hardware H.264 encoder in front of ours
+//! for exports set to Hardware Encoding ([`vt_encode`], `filmcraft_export::register_encoder`). Today that is VideoToolbox on macOS for H.264
 //! (`avcC`) and HEVC (`hvcC`) streams, 8- and 10-bit, 4:2:0 and 4:2:2; on other systems
 //! registration does nothing and reports [`Availability::Unavailable`].
 //!
@@ -26,6 +28,9 @@ pub mod hybrid;
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 pub mod videotoolbox;
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+pub mod vt_encode;
 
 pub use hybrid::HybridDecoder;
 
@@ -45,6 +50,7 @@ pub fn register() -> Availability {
     #[cfg(target_os = "macos")]
     {
         filmcraft_codecs::register_video_decoder(videotoolbox_factory);
+        filmcraft_export::register_encoder(vt_encode::factory);
         Availability::Available("VideoToolbox")
     }
     #[cfg(not(target_os = "macos"))]

@@ -22,8 +22,8 @@
 use egui::{Align2, Color32, Rect, Sense, pos2, vec2};
 use filmcraft_engine::export::presets::{DEFAULT_PRESET, preset_key};
 use filmcraft_engine::export::{
-    AudioCodec, BitrateMode, ExportSettings, FieldOrder, Format, H264Profile, Multiplexer, MxfVideoCodec, Placement, Scaling, TextOverlay, builtin_presets,
-    format_bytes,
+    AudioCodec, BitrateMode, Encoding, ExportSettings, FieldOrder, Format, H264Profile, Multiplexer, MxfVideoCodec, Placement, Scaling, TextOverlay,
+    builtin_presets, format_bytes,
 };
 use filmcraft_engine::time::{FrameRate, Tick};
 use serde::{Deserialize, Serialize};
@@ -700,6 +700,17 @@ fn video_section(ui: &mut egui::Ui, reg: &mut Reg, s: &mut ExportSettings, t: &T
                     s.bitrate_mode = o[i];
                 }
             });
+            if !s.format.is_mxf() {
+                row(ui, t, "Performance", |ui| {
+                    let labels: Vec<(String, bool)> = Encoding::ALL.iter().map(|e| (e.label().to_string(), true)).collect();
+                    if let Some(i) = combo(ui, reg, "export.video.encoding", s.encoding.label(), &labels, 160.0) {
+                        s.encoding = Encoding::ALL[i];
+                    }
+                });
+                if s.encoding == Encoding::Hardware && s.bitrate_mode == BitrateMode::Vbr2Pass {
+                    row(ui, t, "", |ui| ui.label(egui::RichText::new("VBR 2 pass encodes in software").color(t.text_dim).size(11.5)));
+                }
+            }
             row(ui, t, "Bitrate From", |ui| {
                 let cur = if s.target_size.is_some() { "File size" } else { "Bitrate" };
                 if let Some(i) = combo(ui, reg, "export.video.sizeMode", cur, &opts(&["Bitrate", "File size"]), 140.0) {

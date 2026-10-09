@@ -617,7 +617,7 @@ file.exportMedia {path, preset?, settings?, format?, range?, …}     export.qui
 
 | Format | Encoder | Container |
 |---|---|---|
-| `h264` | `filmcraft-h264enc` (profile, level, CBR / VBR 1-pass / VBR 2-pass, keyframe distance) + `filmcraft-aac` | MP4 or QuickTime (`isobmff`, the Multiplexer setting) |
+| `h264` | `filmcraft-h264enc` (profile, level, CBR / VBR 1-pass / VBR 2-pass, keyframe distance), or with Performance ▸ Hardware Encoding the platform's encoder (VideoToolbox on macOS, `platform::vt_encode`) + `filmcraft-aac` | MP4 or QuickTime (`isobmff`, the Multiplexer setting) |
 | `prores` | `filmcraft-prores` (Proxy / LT / 422 / HQ) | MOV |
 | `dnxhr` | `filmcraft-dnx` (LB / SQ / HQ / HQX) | MOV (`AVdh`) |
 | `mjpeg` | built in | MOV |
@@ -634,7 +634,13 @@ file.exportMedia {path, preset?, settings?, format?, range?, …}     export.qui
   `render_sequence`. Through the GPU, frames render one at a time in order (sources decode forwards;
   the encoder still runs in parallel). The GPU frame matches the CPU one within 8-bit rounding
   (`ui-egui/tests/gpu_export.rs`, ≥ 38 dB, typically 55–99 dB).
-- **Reproducible.** The same project and settings give the same file on every machine. Frames render
+- **Hardware encoding.** `ExportSettings::encoding` (Encoding Settings ▸ Performance) is Hardware
+  by default: a factory registered by `filmcraft_platform::register` (`export::register_encoder`)
+  takes H.264 through VideoToolbox — BT.709 limited-range 4:2:0 from our converter, no B-frames,
+  `avcC` from the first packet's format description. It declines VBR 2 pass, HDR, MXF (Annex B),
+  non-square pixels and odd sizes, and any session the OS cannot create: those use our encoder.
+  Hardware output is not bit-reproducible; choose Software Encoding for that.
+- **Reproducible.** With Software Encoding, the same project and settings give the same file on every machine. Frames render
   in batches of one per core, but the muxer gets them in fixed groups of 16 output frames
   (`INTERLEAVE` in `crates/export/src/job.rs`), each followed by its audio, and H.264 uses one slice
   per four macroblock rows instead of one per core. MXF files are the exception: their UMIDs and

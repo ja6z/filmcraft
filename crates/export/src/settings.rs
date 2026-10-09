@@ -84,6 +84,29 @@ impl BitrateMode {
     }
 }
 
+/// Encoding Settings ▸ Performance (H.264): the operating system's hardware encoder when one is
+/// registered and takes the settings (VideoToolbox on macOS), or ours. Hardware encoding is much
+/// faster but not bit-reproducible across machines; VBR 2 pass, HDR, MXF and non-square pixels
+/// always use ours.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Encoding {
+    #[default]
+    Hardware,
+    Software,
+}
+
+impl Encoding {
+    pub const ALL: [Encoding; 2] = [Encoding::Hardware, Encoding::Software];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Encoding::Hardware => "Hardware Encoding",
+            Encoding::Software => "Software Encoding",
+        }
+    }
+}
+
 /// Container of H.264 exports.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

@@ -248,6 +248,8 @@ pub struct ExportSettings {
     /// stream needs is raised.
     pub h264_level: Option<u8>,
     pub bitrate_mode: BitrateMode,
+    /// Performance (H.264): hardware or software encoding ([`Encoding`]).
+    pub encoding: Encoding,
     /// VBR maximum bitrate (None = 1.5 × target).
     pub max_bitrate_kbps: Option<u32>,
     /// Adaptive bitrate (the Match Source presets): bits per pixel per frame; replaces
@@ -447,6 +449,7 @@ impl Default for ExportSettings {
             h264_profile: H264Profile::High,
             h264_level: None,
             bitrate_mode: BitrateMode::default(),
+            encoding: Encoding::default(),
             max_bitrate_kbps: None,
             adaptive_bitrate: None,
             target_size: None,
@@ -573,8 +576,12 @@ fn audio_factories() -> &'static RwLock<Vec<AudioEncoderFactory>> {
     F.get_or_init(|| RwLock::new(vec![aac_factory]))
 }
 
+/// Put an encoder factory in front of the built-in ones (repeated registration is harmless).
 pub fn register_encoder(f: EncoderFactory) {
-    video_factories().write().unwrap_or_else(|e| e.into_inner()).insert(0, f);
+    let mut g = video_factories().write().unwrap_or_else(|e| e.into_inner());
+    if !g.iter().any(|x| std::ptr::fn_addr_eq(*x, f)) {
+        g.insert(0, f);
+    }
 }
 pub fn register_audio_encoder(f: AudioEncoderFactory) {
     audio_factories().write().unwrap_or_else(|e| e.into_inner()).insert(0, f);
