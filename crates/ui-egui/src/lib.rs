@@ -21,6 +21,7 @@ pub mod panels;
 pub mod perf;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod play_ahead;
+pub mod quality;
 pub mod state;
 pub mod theme;
 pub mod widgets;
@@ -139,6 +140,8 @@ pub struct Playback {
     pub hidden: bool,
     /// Forward playback stops here (Play In to Out, Play from Playhead to Out Point).
     pub stop_at: Option<Tick>,
+    /// Preview Quality ▸ Auto's measurement of dropped frames.
+    pub auto_quality: quality::AutoQuality,
 }
 
 /// How long `ui.screenshot` waits for the window to present the frame.
@@ -753,6 +756,7 @@ impl FilmcraftApp {
         if self.playback.anchor_time < 0.0 {
             self.playback.anchor_time = now;
         }
+        quality::tick(self, now);
         let rate = self.session.sequence_rate();
         let elapsed = if self.playback.audio_clock {
             match self.audio.as_ref().and_then(|a| a.played_frames().map(|f| (f, a.sample_rate()))) {

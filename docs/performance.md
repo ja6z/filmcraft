@@ -13,6 +13,26 @@ the before/after comparison relies on. Each milestone below alternated base / af
 each); the most load-independent figure is the decoder's own cycle count (`proc_pid_rusage`
 instructions and cycles of a process, all threads summed).
 
+## Results (GPU3: Lumetri and adjustment layers on the GPU, before → after)
+
+A graded music video (4K HEVC 10-bit D-Log M, 8-angle multicam, Lumetri with an input LUT,
+curves and a vignette on an adjustment layer over the whole sequence), 60 frames at ½ resolution
+on an Apple M2 (`project_bench`, ignored test of a user project):
+
+| | p50 | p95 | GPU-layer frames |
+|---|---|---|---|
+| CPU render (every frame fell back: the adjustment layer was CPU-only) | 224 ms | 606 ms | 0 / 60 |
+| GPU path (plan + composite + readback) | 61 ms | 433 ms | 54 / 60 |
+| plan alone (decode, LUT bake cached) | 10.6 ms | 363 ms | |
+
+The 6 frames left were Film Dissolves (not a dissolve the compositor mixes itself); p95 is seeks
+at the cuts. The bench reads the picture back and converts texels on its own thread, which the
+app does on its frame workers.
+
+**Preview Quality** (View ▸ Preview Quality, the Program monitor's quality menu) sets playback /
+paused resolution and proxies in one choice — Auto (adapts ¼ … Full to the frames playback drops),
+Smooth (¼ / ½, proxies), Balanced (½ / Full, proxies), High Quality (Full, original media).
+
 ## Memory of clips on a timeline (MEM1–MEM3)
 
 Measured on the desktop release build with `footprint`, `heap` and `malloc_history`

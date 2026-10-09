@@ -102,14 +102,26 @@ pub fn route(app: &mut FilmcraftApp, id: &str, params: &Value) -> Option<Result<
     let rest = id.strip_prefix("view.")?;
     let w = which_of(app, params);
     let pfx = prefix(w);
+    if let Some(q) = rest.strip_prefix("previewQuality.") {
+        let q = crate::state::PreviewQuality::from_id(q)?;
+        crate::quality::apply(app, q);
+        let v = &app.ui.program;
+        return Some(Ok(
+            json!({"quality": q.id(), "playbackRes": v.res.label(), "pausedRes": v.paused_res.label(), "proxies": app.session.prefs.media.enable_proxies}),
+        ));
+    }
     if let Some(r) = rest.strip_prefix("playbackRes.") {
         let (_, res) = RES_NAMES.iter().find(|(n, _)| *n == r)?;
-        view_mut(app, w).res = *res;
+        let v = view_mut(app, w);
+        v.res = *res;
+        v.quality = None;
         return Some(Ok(json!({"monitor": pfx, "playbackRes": res.label()})));
     }
     if let Some(r) = rest.strip_prefix("pausedRes.") {
         let (_, res) = RES_NAMES.iter().find(|(n, _)| *n == r)?;
-        view_mut(app, w).paused_res = *res;
+        let v = view_mut(app, w);
+        v.paused_res = *res;
+        v.quality = None;
         return Some(Ok(json!({"monitor": pfx, "pausedRes": res.label()})));
     }
     if let Some(d) = rest.strip_prefix("display.") {
@@ -268,6 +280,9 @@ pub fn checked(app: &FilmcraftApp, id: &str) -> Option<bool> {
     let rest = id.strip_prefix("view.")?;
     let w = which_of(app, &Value::Null);
     let v = view(app, w);
+    if let Some(q) = rest.strip_prefix("previewQuality.") {
+        return crate::state::PreviewQuality::from_id(q).map(|q| app.ui.program.quality == Some(q));
+    }
     if let Some(r) = rest.strip_prefix("playbackRes.") {
         return RES_NAMES.iter().find(|(n, _)| *n == r).map(|(_, x)| *x == v.res);
     }

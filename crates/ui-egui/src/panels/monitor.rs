@@ -281,13 +281,35 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which)
     app.auto.add(&format!("{prefix}.zoom"), zr, "Select Zoom Level");
     monitor_view::zoom_menu(app, &zresp, which);
     let res = mv.res;
-    let rr = Rect::from_min_size(pos2(row1.max.x - 196.0, row1.min.y), vec2(62.0, 24.0));
-    let rresp = crate::widgets::dropdown_text(ui, rr, res.label(), &t, egui::Id::new((prefix, "res")));
+    let quality = if which == Which::Program { mv.quality } else { None };
+    // the Program monitor's button shows the Preview Quality (with the resolution Auto chose)
+    let button = match quality {
+        Some(q @ crate::state::PreviewQuality::Auto) => format!("{} {}", app.ui.language.tr(q.short()), res.label()),
+        Some(q) => app.ui.language.tr(q.short()).to_string(),
+        None => res.label().to_string(),
+    };
+    let rw = if quality.is_some() { 96.0 } else { 62.0 };
+    let rr = Rect::from_min_size(pos2(row1.max.x - 134.0 - rw, row1.min.y), vec2(rw, 24.0));
+    let rresp = crate::widgets::dropdown_text(ui, rr, &button, &t, egui::Id::new((prefix, "res")));
     app.auto.add(&format!("{prefix}.resolution"), rr, "Select Playback Resolution");
     egui::Popup::menu(&rresp).show(|ui| {
+        if which == Which::Program {
+            ui.label(egui::RichText::new(app.ui.language.tr("Preview Quality")).weak());
+            for q in crate::state::PreviewQuality::ALL {
+                let r = ui.selectable_label(quality == Some(q), app.ui.language.tr(q.label()));
+                app.auto.add(&format!("{prefix}.quality.{}", q.id()), r.rect, q.label());
+                if r.clicked() {
+                    crate::quality::apply(app, q);
+                }
+            }
+            ui.separator();
+            ui.label(egui::RichText::new(app.ui.language.tr("Playback Resolution")).weak());
+        }
         for r in PlaybackRes::ALL {
-            if ui.selectable_label(r == res, r.label()).clicked() {
-                monitor_view::view_mut(app, which).res = r;
+            if ui.selectable_label(r == res && quality.is_none(), r.label()).clicked() {
+                let v = monitor_view::view_mut(app, which);
+                v.res = r;
+                v.quality = None;
             }
         }
     });

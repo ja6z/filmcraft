@@ -160,6 +160,16 @@ impl PlaybackRes {
     }
 }
 
+/// Preview Quality (see [`crate::quality`]): sets the playback / paused resolutions and proxies at
+/// once; Auto adapts the playback resolution to dropped frames.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PreviewQuality {
+    Auto,
+    Smooth,
+    Balanced,
+    High,
+}
+
 /// Header mode (Home / Import / Edit / Export).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Mode {
@@ -269,6 +279,8 @@ pub struct MonitorView {
     pub paused_res: PlaybackRes,
     /// High Quality Playback: play at the paused resolution when it is higher.
     pub high_quality: bool,
+    /// Preview Quality preset in effect (None: resolutions chosen by hand).
+    pub quality: Option<PreviewQuality>,
     /// Magnification: None = Fit, else the zoom factor (1.0 = 100%: one frame pixel per screen pixel).
     pub zoom: Option<f32>,
     /// Pan offset of a magnified picture from the centre (points).
@@ -294,6 +306,7 @@ impl Default for MonitorView {
             res: PlaybackRes::Half,
             paused_res: PlaybackRes::Full,
             high_quality: false,
+            quality: None,
             zoom: None,
             pan: [0.0, 0.0],
             safe_margins: false,

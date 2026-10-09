@@ -265,8 +265,15 @@ file ──► codecs (MP4/MOV, MKV, audio)        demux + decode, GOP-aware see
   the effects' parameters evaluated at that time: the source is drawn into an `Rgba32Float`
   working image at the size the CPU decodes it, each effect runs as compute passes with the CPU
   reference's math (effects, then Motion, then Opacity / blend, as on the CPU), and the result is
-  placed like any layer. Other standard effects, effect and opacity masks, adjustment layers,
-  nested sequences (except a plain one, whose own layers go into the plan: same frame size and
+  placed like any layer. Lumetri joins that set in the preview: its colour stages are baked into
+  a 33³ LUT over display-encoded 0…1 (cached per parameter set; tetrahedral in the shader), the
+  vignette runs as its own op between the Basic and Curves stages and the Creative sharpen as an
+  Unsharp op, so the preview matches the exact CPU Lumetri the export keeps at 54–60 dB (HDR
+  grades and HSL Denoise / Blur stay on the CPU). An adjustment layer of the top sequence whose
+  effects the GPU covers (unmasked, no opacity masks, Motion leaving it full frame, not in a
+  transition) is planned as an *adjust* layer: its effects run on the accumulator and the result
+  is drawn over it with the layer's opacity and blend, as the CPU does. Other standard effects,
+  effect and opacity masks, other adjustment layers, nested sequences (except a plain one, whose own layers go into the plan: same frame size and
   colour settings as its parent, nothing on the clip that changes the picture, every layer inside
   blended normally) and non-dissolve transitions are rendered on the CPU for that layer or frame
   and handed to the GPU as an image (a layer image keeps its clip's blend mode), so both paths
