@@ -1407,6 +1407,7 @@ fn build() -> Vec<CommandSpec> {
             has_seq,
             set_transition
         ),
+        cmd!("sequence.removeTransition", "Remove Transition", ["Sequence"], None, r#"{"transition":id|[id]?}"#, has_seq, remove_transition),
         cmd!("sequence.closeGap", "Close Gap", ["Sequence"], None, r#"{"track":"V1"|id,"time":ticks}"#, has_seq, |s, p| {
             let tr = track_p(s, p, "track", "sequence.closeGap")?.ok_or_else(|| bad("sequence.closeGap", "need `track`"))?;
             let t = time_p(s, p, "").unwrap_or(s.playhead());
@@ -2977,6 +2978,42 @@ fn set_transition(s: &mut Session, p: &Value) -> Result<Value> {
         Ok(())
     })?;
     Ok(json!({"transition": id, "effect": cur.effect.effect, "reverse": cur.reverse}))
+}
+
+/// `sequence.removeTransition`: take transitions off, leaving straight cuts (the clips keep their
+/// in and out points). `transition`: an id or a list of ids; without it, the transitions under
+/// the playhead — only on the selected clips' tracks when clips are selected. One undo step.
+fn remove_transition(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "sequence.removeTransition";
+    let q = s.active_sequence().ok_or(EngineError::NoSequence)?;
+    let all = || q.video_tracks.iter().chain(q.audio_tracks.iter());
+    let ids: Vec<u64> = match p.get("transition") {
+        None | Some(Value::Null) => {
+            let t = s.playhead();
+            let tracks: Vec<TrackId> = s.state.selection.iter().filter_map(|c| q.find_item(*c).map(|(tid, _)| tid)).collect();
+            all()
+                .filter(|tr| tracks.is_empty() || tracks.contains(&tr.id))
+                .flat_map(|tr| tr.transitions.iter().filter(|x| x.range().contains(t)).map(|x| x.id.0))
+                .collect()
+        }
+        Some(Value::Array(a)) => a.iter().map(|v| v.as_u64().ok_or_else(|| bad(CMD, "`transition` ids are numbers"))).collect::<Result<_>>()?,
+        Some(v) => vec![v.as_u64().ok_or_else(|| bad(CMD, "`transition` is an id or a list of ids"))?],
+    };
+    if ids.is_empty() {
+        return Err(bad(CMD, "no transition under the playhead"));
+    }
+    if let Some(id) = ids.iter().find(|id| !all().any(|tr| tr.transitions.iter().any(|x| x.id.0 == **id))) {
+        return Err(bad(CMD, format!("no transition {id}")));
+    }
+    let label = if ids.len() == 1 { "Remove Transition" } else { "Remove Transitions" };
+    let gone = ids.clone();
+    s.edit_sequence(label, move |q, _, _| {
+        for tr in q.video_tracks.iter_mut().chain(q.audio_tracks.iter_mut()) {
+            tr.transitions.retain(|x| !gone.contains(&x.id.0));
+        }
+        Ok(())
+    })?;
+    Ok(json!({"removed": ids}))
 }
 
 fn apply_transition(s: &mut Session, p: &Value, kind: TrackKind) -> Result<Value> {

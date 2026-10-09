@@ -377,6 +377,7 @@ const SPANISH: &[(&str, &str)] = &[
     ("Remove Attributes…", "Quitar atributos…"),
     ("Remove Filler Words", "Quitar muletillas"),
     ("Remove Pauses", "Quitar pausas"),
+    ("Remove Transition", "Quitar transición"),
     ("Remove Unused", "Quitar no utilizados"),
     ("Rename…", "Cambiar nombre…"),
     ("Render Audio", "Procesar audio"),

@@ -198,6 +198,29 @@ fn transition_params_and_reverse_via_commands() {
 }
 
 #[test]
+fn remove_transition_leaves_a_cut_and_undoes() {
+    let mut s = demo();
+    let cut = s.active_sequence().unwrap().video_tracks[0].items[2].start;
+    s.execute("playhead.set", json!({"time": cut.0})).unwrap();
+    let ids = |s: &Session| s.active_sequence().unwrap().video_tracks[0].transitions.iter().map(|t| t.id.0).collect::<Vec<_>>();
+    let n = ids(&s).len();
+    let a = s.execute("sequence.applyVideoTransition", json!({"effect": "flash", "frames": 6})).unwrap()["transition"].as_u64().unwrap();
+    let items = s.active_sequence().unwrap().video_tracks[0].items.clone();
+    // by id
+    let r = s.execute("sequence.removeTransition", json!({"transition": a})).unwrap();
+    assert_eq!(r["removed"], json!([a]));
+    assert!(!ids(&s).contains(&a) && ids(&s).len() == n);
+    assert_eq!(s.active_sequence().unwrap().video_tracks[0].items, items, "the clips keep their edit points");
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(ids(&s).contains(&a));
+    // the ones under the playhead
+    s.execute("sequence.removeTransition", json!({})).unwrap();
+    assert!(!ids(&s).contains(&a));
+    assert!(s.execute("sequence.removeTransition", json!({})).is_err(), "nothing left at the cut");
+    assert!(s.execute("sequence.removeTransition", json!({"transition": 999_999})).is_err());
+}
+
+#[test]
 fn effects_list_reports_transition_folders() {
     let s = demo();
     let mut s = s;

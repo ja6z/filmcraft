@@ -48,6 +48,8 @@ pub struct TlState {
     /// display gain: scanning the whole source per clip per frame cost more than drawing.
     peak_max: HashMap<ItemId, (usize, f32)>,
     zoom_anchor: Option<(f64, f32)>,
+    /// The transition right-clicked for the context menu (None: the clip menu).
+    menu_transition: Option<filmcraft_project::TransitionId>,
 }
 
 impl TlState {
@@ -2050,16 +2052,37 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
         }
     }
 
-    // ---- context menu on clips (right-clicking an unselected clip selects it first)
+    // ---- context menu on clips (right-clicking an unselected clip selects it first) and on
+    // transitions
     if resp.secondary_clicked()
         && let Some(p) = resp.interact_pointer_pos()
-        && let Hit::Clip { clip, .. } = hit(seq, layout, p)
-        && !app.session.state.selection.contains(&clip)
     {
-        let _ = app.session.execute("timeline.select", json!({"clips": [clip.0]}));
+        let h = hit(seq, layout, p);
+        app.tl.menu_transition = match h {
+            Hit::Transition { id, .. } => Some(id),
+            _ => None,
+        };
+        if let Hit::Clip { clip, .. } = h
+            && !app.session.state.selection.contains(&clip)
+        {
+            let _ = app.session.execute("timeline.select", json!({"clips": [clip.0]}));
+        }
     }
     resp.context_menu(|ui| {
         ui.set_min_width(220.0);
+        if let Some(id) = app.tl.menu_transition {
+            let label = app.ui.language.tr("Remove Transition").to_string();
+            let r = ui.button(label);
+            app.auto.add("timeline.transitionMenu.remove", r.rect, "Remove Transition");
+            if r.clicked() {
+                if let Err(e) = app.session.execute("sequence.removeTransition", json!({"transition": id.0})) {
+                    app.ui.status = e.to_string();
+                }
+                app.tl.menu_transition = None;
+                ui.close();
+            }
+            return;
+        }
         let sel = app.session.state.selection.clone();
         let picked: Vec<&filmcraft_project::TrackItem> = sel.iter().filter_map(|c| seq.find_item(*c).map(|(_, it)| it)).collect();
         let all_enabled = !picked.is_empty() && picked.iter().all(|it| it.enabled);
