@@ -18,6 +18,8 @@ struct U {
 // Unsharp Mask: the image before blurring. Lut3: the baked 3D LUT, n² × n texels, entry
 // (r, g, b) at (r + g·n, b).
 @group(0) @binding(3) var aux: texture_2d<f32>;
+// Masked effects: the coverage (0…1) in the red channel, w × h.
+@group(0) @binding(4) var cov: texture_2d<f32>;
 
 const OP_BRIGHTNESS_CONTRAST: u32 = 1u;
 const OP_PROC_AMP: u32 = 2u;
@@ -48,6 +50,7 @@ const OP_MIRROR: u32 = 28u;
 const OP_OFFSET: u32 = 29u;
 const OP_LUT3: u32 = 30u;
 const OP_VIGNETTE: u32 = 31u;
+const OP_MASK_MIX: u32 = 32u;
 
 fn size() -> vec2<i32> {
     return vec2<i32>(i32(u.i0.y), i32(u.i0.z));
@@ -443,6 +446,12 @@ fn pixel(op: u32, p: vec2<i32>) -> vec4<f32> {
             }
             return acc / f32(steps);
         }
+        case OP_MASK_MIX: {
+            // src: the effect's result, aux: the original (premultiplied, all four channels)
+            let o = textureLoad(aux, p, 0);
+            let c = textureLoad(cov, p, 0).x;
+            return o + (ld(p) - o) * c;
+        }
         case OP_UNSHARP: {
             // src: the blurred image, aux: the original
             var o = textureLoad(aux, p, 0);
@@ -568,29 +577,35 @@ fn fx_px(@builtin(global_invocation_id) id: vec3<u32>) {
     textureStore(dst, p, pixel(u.i0.x, p));
 }
 
-// A box pass as a running sum along one row (i1.z = 0) or column (1) per invocation: O(1) per
-// pixel for any radius, the arithmetic of `effects::box_rows`.
+// A box pass as a running sum along one segment (i1.w pixels) of a row (i1.z = 0) or column (1)
+// per invocation: O(1) per pixel for any radius, the arithmetic of `effects::box_rows` (the window
+// a segment starts with is summed directly).
 @compute @workgroup_size(64)
 fn fx_run(@builtin(global_invocation_id) id: vec3<u32>) {
     let s = size();
     let vertical = u.i1.z != 0u;
     let n = select(s.x, s.y, vertical);
     let lines = select(s.y, s.x, vertical);
-    let line = i32(id.x);
+    let seg = i32(max(u.i1.w, 1u));
+    let segs = (n + seg - 1) / seg;
+    let k = i32(id.x);
+    let line = k / segs;
     if line >= lines {
         return;
     }
+    let x0 = (k % segs) * seg;
+    let x1 = min(x0 + seg, n);
     let r = i32(u.i1.x);
     let repeat = u.i1.y != 0u;
     let inv = 1.0 / f32(2 * r + 1);
     var acc = vec4(0.0);
-    for (var i = -r; i <= r; i++) {
+    for (var i = x0 - r; i <= x0 + r; i++) {
         if repeat || (i >= 0 && i < n) {
             let j = clamp(i, 0, n - 1);
             acc += ld(select(vec2(j, line), vec2(line, j), vertical));
         }
     }
-    for (var x = 0; x < n; x++) {
+    for (var x = x0; x < x1; x++) {
         textureStore(dst, select(vec2(x, line), vec2(line, x), vertical), acc * inv);
         let out_i = x - r;
         let in_i = x + r + 1;

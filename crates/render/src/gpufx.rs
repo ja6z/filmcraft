@@ -50,6 +50,15 @@ pub enum FxOp {
     Vignette {
         p: [f32; 4],
     },
+    /// An effect limited by its masks: `ops` applied to the working image, mixed back over the
+    /// original by `cov` (`w`×`h` coverage 0…1, [`crate::mask::effect_coverage`]) — the CPU's
+    /// `mask::apply_effect`. Ops with a combine stage (Unsharp) and nested masks stay on the CPU.
+    Masked {
+        ops: Vec<FxOp>,
+        cov: Arc<Vec<f32>>,
+        w: u32,
+        h: u32,
+    },
     BrightnessContrast {
         br: f32,
         co: f32,
@@ -223,6 +232,22 @@ pub const BAKE_SIZE: usize = 33;
 /// in [`GPU_EFFECTS`] map to their one [`FxOp::eval`] op; Lumetri (SDR, no HSL Denoise / Blur)
 /// to a baked LUT, the vignette between its stages and the Creative sharpen.
 pub fn gpu_ops(e: &EffectInstance, cx: &FxCtx, w: usize, h: usize) -> Option<Vec<FxOp>> {
+    let ops = gpu_ops_unmasked(e, cx, w, h)?;
+    if ops.is_empty() || !e.enabled {
+        return Some(ops);
+    }
+    // an effect with masks applies only inside them (the coverage is worked out at the working
+    // image's size, as the CPU's `mask::apply_effect` does)
+    match crate::mask::effect_coverage(&e.masks, cx.t, cx.px_scale, w, h) {
+        Some(cov) => {
+            let op = FxOp::Masked { ops, cov: Arc::new(cov), w: w as u32, h: h as u32 };
+            op.gpu_ok().then(|| vec![op])
+        }
+        None => Some(ops),
+    }
+}
+
+fn gpu_ops_unmasked(e: &EffectInstance, cx: &FxCtx, w: usize, h: usize) -> Option<Vec<FxOp>> {
     if !e.enabled {
         return Some(Vec::new());
     }
@@ -542,6 +567,11 @@ impl FxOp {
         match self {
             FxOp::Lut3 { lut, .. } => lut.size >= 2 && lut.data.iter().all(|c| fin(c)),
             FxOp::Vignette { p } => fin(p),
+            FxOp::Masked { ops, cov, w, h } => {
+                cov.len() == *w as usize * *h as usize
+                    && cov.iter().all(|c| c.is_finite())
+                    && ops.iter().all(|o| o.gpu_ok() && !matches!(o, FxOp::Unsharp { .. } | FxOp::Masked { .. }))
+            }
             FxOp::BrightnessContrast { br, co } => fin(&[*br, *co]),
             FxOp::ProcAmp { br, co, hue, sat } => fin(&[*br, *co, *hue, *sat]),
             FxOp::Tint { black, white, amount } => fin(black) && fin(white) && amount.is_finite(),
@@ -580,6 +610,15 @@ impl FxOp {
         }
         match self {
             FxOp::Lut3 { lut, .. } => img.map_rgb(|c, _, _| lut.apply(enc(c))),
+            FxOp::Masked { ops, cov, w, h } => {
+                let original = img.clone();
+                for op in ops {
+                    op.apply(img);
+                }
+                if (img.w, img.h) == (*w as usize, *h as usize) {
+                    crate::mask::mix(img, &original, cov);
+                }
+            }
             FxOp::Vignette { p } => {
                 let (w, h) = (img.w as f32, img.h as f32);
                 img.map_rgb(|c, x, y| dec(crate::effects::vignette_px(enc(c), x as f32, y as f32, w, h, *p)));

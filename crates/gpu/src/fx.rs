@@ -9,8 +9,11 @@
 //! pooled per size; layers without effects never touch any of this.
 //!
 //! Box blurs (Gaussian Blur, Camera Blur, the blur inside Unsharp / Sharpen) run per pixel for
-//! radii up to [`BOX_PER_PIXEL_MAX`] and as a running sum per row / column above, so a huge
-//! radius costs O(1) per pixel like on the CPU (radii are capped by `gaussian_boxes`).
+//! radii up to [`BOX_PER_PIXEL_MAX`] and as running sums above, so a huge radius costs O(1) per
+//! pixel like on the CPU (radii are capped by `gaussian_boxes`). A row / column is cut into
+//! segments of at least 64 pixels (and of the window's width, so the sum a segment starts with
+//! costs about what it slides over), one invocation each: a 1080p frame is thousands of
+//! invocations instead of one per line, which left most of the GPU idle.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -23,7 +26,7 @@ use filmcraft_render::plan::LayerFx;
 /// Working texture format.
 pub(crate) const FX_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 /// Box radii up to this many pixels are summed per output pixel; larger ones as a running sum.
-pub const BOX_PER_PIXEL_MAX: u32 = 32;
+pub const BOX_PER_PIXEL_MAX: u32 = 6;
 
 const OP_BRIGHTNESS_CONTRAST: u32 = 1;
 const OP_PROC_AMP: u32 = 2;
@@ -54,6 +57,8 @@ const OP_MIRROR: u32 = 28;
 const OP_OFFSET: u32 = 29;
 const OP_LUT3: u32 = 30;
 const OP_VIGNETTE: u32 = 31;
+/// Masked effect: `lerp(original (aux), processed (src), coverage)`.
+const OP_MASK_MIX: u32 = 32;
 /// Baked LUT textures kept between frames.
 const LUT_CACHE: usize = 16;
 
@@ -69,6 +74,10 @@ pub(crate) struct FxStage {
     used: HashSet<(u32, u32)>,
     /// Baked LUTs (`FxOp::Lut3`) as n² × n textures, by bake key, oldest first.
     luts: Vec<(u64, Target)>,
+    /// Mask coverage textures (R32Float, w × h) of this frame's masked effects; one each, since
+    /// the queue's writes all land before the frame's passes run.
+    cov_pool: HashMap<(u32, u32), Vec<Target>>,
+    cov_next: HashMap<(u32, u32), usize>,
 }
 
 /// One compute pass of a job.
@@ -101,6 +110,8 @@ struct Step {
     unsharp_blur: bool,
     /// A baked LUT the pass reads (bound as `aux`).
     lut: Option<(u64, Arc<Lut3d>)>,
+    /// A mask coverage image the pass reads (bound as `cov`): data, width, height.
+    cov: Option<(Arc<Vec<f32>>, u32, u32)>,
 }
 
 fn step(code: u32, i1: [u32; 4], p: &[f32]) -> Step {
@@ -108,13 +119,14 @@ fn step(code: u32, i1: [u32; 4], p: &[f32]) -> Step {
     for (d, s) in q.iter_mut().zip(p) {
         *d = *s;
     }
-    Step { run: false, code, i1, p: q, combine: false, unsharp_blur: false, lut: None }
+    Step { run: false, code, i1, p: q, combine: false, unsharp_blur: false, lut: None, cov: None }
 }
 
 /// Box passes along x (vertical = false) or y for the radii (radius 0 is a no-op on the CPU).
 fn boxes(radii: &[u32], vertical: bool, repeat: bool, out: &mut Vec<Step>) {
     for &r in radii.iter().filter(|r| **r > 0) {
-        let mut s = step(OP_BOX, [r, repeat as u32, vertical as u32, 0], &[]);
+        // (the segment length rides in the fourth integer)
+        let mut s = step(OP_BOX, [r, repeat as u32, vertical as u32, (2 * r + 1).clamp(64, 1024)], &[]);
         s.run = r > BOX_PER_PIXEL_MAX;
         out.push(s);
     }
@@ -130,6 +142,20 @@ fn steps(op: &FxOp) -> Vec<Step> {
             out.push(s);
         }
         FxOp::Vignette { p } => out.push(step(OP_VIGNETTE, [0; 4], p)),
+        FxOp::Masked { ops, cov, w, h } => {
+            // the effect's passes keep the original (as Unsharp's blur passes do), then one pass
+            // mixes it back by the coverage
+            for s in ops.iter().flat_map(steps).map(|mut s| {
+                s.unsharp_blur = true;
+                s
+            }) {
+                out.push(s);
+            }
+            let mut s = step(OP_MASK_MIX, [0; 4], &[]);
+            s.combine = true;
+            s.cov = Some((cov.clone(), *w, *h));
+            out.push(s);
+        }
         FxOp::BrightnessContrast { br, co } => out.push(step(OP_BRIGHTNESS_CONTRAST, [0; 4], &[*br, *co])),
         FxOp::ProcAmp { br, co, hue, sat } => out.push(step(OP_PROC_AMP, [0; 4], &[*br, *co, *hue, *sat])),
         FxOp::Tint { black, white, amount } => {
@@ -244,6 +270,7 @@ impl FxStage {
                     count: None,
                 },
                 tex(3),
+                tex(4),
             ],
         });
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("fx"), bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
@@ -278,18 +305,31 @@ impl FxStage {
             multiview_mask: None,
             cache: None,
         });
-        Self { px: compute("fx_px"), run: compute("fx_run"), bgl, source, pool: HashMap::new(), used: HashSet::new(), luts: Vec::new() }
+        Self {
+            px: compute("fx_px"),
+            run: compute("fx_run"),
+            bgl,
+            source,
+            pool: HashMap::new(),
+            used: HashSet::new(),
+            luts: Vec::new(),
+            cov_pool: HashMap::new(),
+            cov_next: HashMap::new(),
+        }
     }
 
     /// Start a frame: pooled textures of sizes no layer uses by [`end_frame`](Self::end_frame)
     /// are released then.
     pub(crate) fn begin_frame(&mut self) {
         self.used.clear();
+        self.cov_next.clear();
     }
 
     pub(crate) fn end_frame(&mut self) {
         let used = &self.used;
         self.pool.retain(|k, _| used.contains(k));
+        let cov = &self.cov_next;
+        self.cov_pool.retain(|k, _| cov.contains_key(k));
     }
 
     /// No working textures held.
@@ -331,6 +371,46 @@ impl FxStage {
             self.luts.remove(0);
         }
         Some(v)
+    }
+
+    /// A coverage texture holding `data` (w × h), distinct for every call of the frame.
+    fn coverage(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, data: &[f32], size: (u32, u32)) -> Option<wgpu::TextureView> {
+        let (w, h) = size;
+        if w == 0
+            || h == 0
+            || data.len() != w as usize * h as usize
+            || w > device.limits().max_texture_dimension_2d
+            || h > device.limits().max_texture_dimension_2d
+        {
+            return None;
+        }
+        let k = self.cov_next.entry(size).or_insert(0);
+        let idx = *k;
+        *k += 1;
+        let v = self.cov_pool.entry(size).or_default();
+        while v.len() <= idx {
+            let t = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("filmcraft-fx-coverage"),
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R32Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let view = t.create_view(&Default::default());
+            v.push((t, view));
+        }
+        let (t, view) = &v[idx];
+        let bytes: Vec<u8> = data.iter().flat_map(|c| c.to_le_bytes()).collect();
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: t, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            &bytes,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: Some(h) },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        Some(view.clone())
     }
 
     fn targets(&mut self, device: &wgpu::Device, size: (u32, u32), n: usize) -> Vec<Target> {
@@ -392,6 +472,13 @@ impl FxStage {
                 Some((key, lut)) => Some(self.lut_view(device, queue, *key, lut)?),
                 None => None,
             };
+            let cov_view = match &s.cov {
+                Some((data, cw, ch)) => Some(self.coverage(device, queue, data, (*cw, *ch))?),
+                None => None,
+            };
+            if s.cov.as_ref().is_some_and(|(_, cw, ch)| (*cw, *ch) != (w, h)) {
+                return None;
+            }
             let aux = match (s.combine, orig, &lut_view) {
                 (_, _, Some(l)) => l,
                 (true, Some(o), _) => views.get(o)?,
@@ -419,11 +506,13 @@ impl FxStage {
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(views.get(cur)?) },
                     wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(views.get(dst)?) },
                     wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(aux) },
+                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(cov_view.as_ref().unwrap_or(dummy)) },
                 ],
             });
             let groups = if s.run {
-                let lines = if s.i1[2] != 0 { w } else { h };
-                (lines.div_ceil(64), 1)
+                let (lines, n) = if s.i1[2] != 0 { (w, h) } else { (h, w) };
+                let segments = lines * n.div_ceil(s.i1[3].max(1));
+                (segments.div_ceil(64), 1)
             } else {
                 (w.div_ceil(16), h.div_ceil(16))
             };

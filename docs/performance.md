@@ -50,6 +50,36 @@ VideoToolbox. With Performance ▸ Hardware Encoding (VideoToolbox H.264, the de
 export takes **10.0 s** (19 s of CPU time) — 4.6× the CPU render with our encoder. Rendering the GPU frames in parallel was slower (63 s): every rayon thread seeked
 its own frame in the long-GOP HEVC sources.
 
+## Results (GPU5: masked effects, multi-camera clips with effects, frame blending, blur)
+
+`project_bench::timeline_scan` (ignored test of a user project: `FILMCRAFT_BENCH_PROJECT=… cargo
+test --release -p filmcraft-ui-egui --test project_bench timeline_scan -- --ignored --nocapture`)
+plays 6 frames every few seconds through the whole sequence on the proxies at ½ resolution and
+prints, per sample, the cost the frame workers pay (plan + layer preparation) and the GPU's draw.
+A 3-minute graded multicam music video (8-angle multicam on V1, an adjustment layer with Lumetri,
+masked Gaussian Blurs on nine multicam clips, six B-roll clips at 60 % with Optical Flow) on an
+Apple M2, same samples before → after:
+
+| frames with | workers (plan + prepare) | GPU draw |
+|---|---|---|
+| a masked blur on a multi-camera clip (9 clips) | 50–73 ms → 10–13 ms | 10 → 30 ms |
+| B-roll at 60 % (Frame Blending / Optical Flow) | 62–125 ms → 24–47 ms | 17–29 → 24–61 ms |
+| everything else | 8–40 ms | 12–20 ms |
+
+What changed: (1) masked effects run on the GPU (`FxOp::Masked`: the effect's passes keep the
+original, one more pass mixes it back by the mask's coverage, computed on the CPU at the working
+size and uploaded as an R32Float texture); (2) a multi-camera clip showing an angle draws the
+angle's clip through its own effects and Motion (`plan::push_media_gpu` with an `Outer`), instead
+of rendering the whole nested sequence on the CPU; (3) frame-blended clips are two layers (the
+frame and the next, the second at the blend weight) instead of a CPU image; (4) the GPU box blur
+runs its running sums per segment (≥ 64 px) of a row / column instead of one invocation per line.
+The GPU-side blur is the new cost: 6 passes over a 1080p `Rgba32Float` image. The CPU reference
+keeps its exact result (the GPU frame is 44 dB from it, the Lumetri bake's own error).
+
+Proxies made with *Only used ranges* cover the clips as they were when made: a clip placed
+afterwards from outside those ranges decodes the original (a 4K HEVC GOP seek per frame, 100+ ms):
+make the proxies again (`media.createProxies … onlyUsed`) after adding B-roll.
+
 ## Memory of clips on a timeline (MEM1–MEM3)
 
 Measured on the desktop release build with `footprint`, `heap` and `malloc_history`

@@ -469,3 +469,86 @@ fn visible_region_conversion_without_effects_matches_the_whole_picture() {
     }
     let _ = &mut p;
 }
+
+fn max_diff(a: &Image, b: &Image) -> f32 {
+    assert_eq!((a.w, a.h), (b.w, b.h));
+    a.px.iter().zip(&b.px).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max)
+}
+
+/// Frame Blending / Optical Flow (rendered as blending) of a speed-changed clip: the plan draws the
+/// frame and the next one as two GPU layers instead of falling back to a CPU image per frame, and
+/// their mix is the CPU's `lerp` of the two.
+#[test]
+fn frame_blended_clips_plan_as_two_gpu_layers() {
+    let (mut p, _red, ocean, seq, map) = setup();
+    let id = place(&mut p, seq, 0, ocean, 0, 48);
+    {
+        let (_, it) = p.sequence_mut(seq).unwrap().find_item_mut(id).unwrap();
+        it.speed = 0.6;
+        it.time_interpolation = filmcraft_project::TimeInterpolation::FrameBlending;
+    }
+    let r = FrameRate::FPS_24;
+    let opts = RenderOptions::default();
+    let mut blended = 0;
+    for f in [5, 6, 7, 8, 9, 10] {
+        let t = r.tick_of(f);
+        let plan = plan::plan_frame(&p, seq, t, opts, &map);
+        let plan::FramePlan::Layers { layers, .. } = &plan else { panic!("GPU-drawable") };
+        let (_, it) = p.sequence(seq).unwrap().find_item(id).unwrap();
+        let blend = interpolation_blend(it, t, map.0[&ocean].info().frame_rate());
+        assert_eq!(layers.len(), if blend.is_some() { 2 } else { 1 }, "frame {f}");
+        if let Some((_, w)) = blend {
+            blended += 1;
+            assert!((layers[1].opacity - w).abs() < 1e-6 && layers[0].opacity == 1.0);
+        }
+        let d = max_diff(&plan::execute_cpu(&plan), &render_sequence(&p, seq, t, opts, &map));
+        assert!(d < 2e-3, "frame {f}: plan and reference differ by {d}");
+    }
+    assert!(blended >= 4, "most of these frames fall between source frames ({blended})");
+}
+
+/// A multi-camera clip showing an angle with a masked blur, a grade and a push-in: the angle's
+/// clip is drawn on the GPU through them (one layer with an effect stage), not rendered whole on
+/// the CPU, and the picture is the reference's.
+#[test]
+fn a_multicam_clip_with_effects_and_motion_is_drawn_on_the_gpu() {
+    use filmcraft_project::{Mask, MaskPath, ParamValue};
+    let (mut p, _red, ocean, _seq, map) = setup();
+    let r = FrameRate::FPS_24;
+    // sequences of the clip's own size: the angle's clip fills the nested canvas, as camera
+    // angles do in a multi-camera source
+    let v = map.0[&ocean].info().video.clone().unwrap();
+    let (w, h) = (v.width, v.height);
+    let cam = p.new_sequence("cam", SequenceSettings { width: w, height: h, frame_rate: r, ..Default::default() }, 1, 0, None);
+    place(&mut p, cam, 0, ocean, 0, 96);
+    let outer = p.new_sequence("outer", SequenceSettings { width: w, height: h, frame_rate: r, ..Default::default() }, 1, 0, None);
+    let mut it = p.make_track_item(cam, TrackKind::Video, Tick::ZERO, TimeRange::new(Tick::ZERO, r.tick_of(48)), r).unwrap();
+    it.multicam = Some(filmcraft_project::multicam::MulticamSel { enabled: true, angle: 0 });
+    let mut blur = filmcraft_project::find_effect("gaussian_blur").unwrap().instance();
+    blur.params.get_mut("blurriness").unwrap().value = ParamValue::Float(30.0);
+    let mut m = Mask::new("band", MaskPath::rect(w as f64 * 0.6, -50.0, w as f64 * 1.2, h as f64 + 50.0));
+    m.feather.value = ParamValue::Float(40.0);
+    blur.masks.push(m);
+    it.effects.push(blur);
+    it.effect_mut("motion").unwrap().params.get_mut("scale").unwrap().value = ParamValue::Float(112.0);
+    p.sequence_mut(outer).unwrap().video_tracks[0].items.push(it);
+    let t = r.tick_of(10);
+    let opts = RenderOptions::default();
+    let plan = plan::plan_frame(&p, outer, t, opts, &map);
+    let plan::FramePlan::Layers { layers, .. } = &plan else { panic!("a layered plan") };
+    assert_eq!(layers.len(), 1);
+    assert!(layers[0].fx.as_ref().is_some_and(|fx| fx.ops.iter().any(|o| matches!(o, gpufx::FxOp::Masked { .. }))), "the masked blur is on the GPU");
+    assert_eq!((layers[0].frame.width, layers[0].frame.height), (w, h), "the angle's own frame, not a CPU canvas");
+    let d = max_diff(&plan::execute_cpu(&plan), &render_sequence(&p, outer, t, opts, &map));
+    assert!(d < 0.02, "plan and reference differ by {d}");
+    // without the effects and motion it is the direct path as before
+    {
+        let it = &mut p.sequence_mut(outer).unwrap().video_tracks[0].items[0];
+        it.effects.retain(|e| e.def().is_some_and(|d| d.intrinsic));
+        it.effect_mut("motion").unwrap().params.get_mut("scale").unwrap().value = ParamValue::Float(100.0);
+    }
+    let plan = plan::plan_frame(&p, outer, t, opts, &map);
+    let plan::FramePlan::Layers { layers, .. } = &plan else { panic!("a layered plan") };
+    assert_eq!(layers.len(), 1);
+    assert!(layers[0].fx.is_none());
+}

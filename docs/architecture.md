@@ -216,6 +216,14 @@ file ──► codecs (MP4/MOV, MKV, audio)        demux + decode, GOP-aware see
         ui-egui frames.rs worker pool ──► monitors (program/source), thumbnails, prefetch
 ```
 
+- **What the GPU plan draws** (`render::plan::push_item`): media clips with any standard effect that
+  has a GPU op, masked or not (`gpufx::gpu_ops` wraps a masked effect's ops in `FxOp::Masked`);
+  multi-camera clips showing an angle, through their own effects and Motion (the angle's clip is
+  pushed with the clip's Motion and effects after its own — nested size = sequence size, and the
+  angle's clip filling it, so the nested canvas is the clip's picture); speed-changed clips with
+  Frame Blending / Optical Flow as two layers (frame, next frame at the weight); adjustment layers
+  with unmasked effects. Everything else (HDR / log needing colour management, effects without a
+  GPU op, opacity masks, nested sequences that are not plain) is rendered whole on the CPU.
 - **Sources.** `media::MediaSource` yields `video_frame(FrameRequest)` and
   `audio(start, frames, rate)` in media time. Sources are `Send + Sync` and shared by monitors,
   thumbnails, playback and export. The engine's `MediaPool` creates one per project item, lazily,

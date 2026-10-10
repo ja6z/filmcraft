@@ -577,3 +577,63 @@ fn adjustment_layers_composite_like_the_cpu_plan() {
     let (_, _, gpu) = c.read_output().expect("readback");
     assert!(gpu.chunks(4).all(|p| p[0] < 3 && p[1] < 3 && p[2] < 3), "an empty picture stays black");
 }
+
+/// An effect limited by its masks (`FxOp::Masked`): the GPU mixes the effect's result back over
+/// the original by the mask's coverage like the CPU's `mask::apply_effect` — a feathered polygon
+/// over a blur, a tint and a chain of both, with a second layer drawn after it to prove the
+/// stage's textures (the coverage ones too) don't leak between layers.
+#[test]
+fn masked_effects_match_the_cpu() {
+    use filmcraft_render::mask::{FlatMask, coverage};
+    let Some((dev, q)) = device() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let mut c = GpuCompositor::new(&dev, &q);
+    let (w, h) = (96u32, 54u32);
+    let px = picture(w, h);
+    let frame = VideoFrame::rgba_f32(w, h, px.clone());
+    let band = |x0: f32, feather: f32, inverted: bool| FlatMask {
+        pts: vec![[x0, -10.0], [w as f32 + 10.0, -10.0], [w as f32 + 10.0, h as f32 + 10.0], [x0, h as f32 + 10.0]],
+        feather,
+        expansion: 0.0,
+        opacity: 1.0,
+        inverted,
+        mode: filmcraft_project::MaskMode::Add,
+    };
+    let cx0 = cx(Tick::ZERO, 1.0);
+    let blur = FxOp::eval(&effect("gaussian_blur", &[("blurriness", fl(40.0))]), &cx0, w as usize, h as usize).expect("blur");
+    let tint = FxOp::eval(&effect("tint", &[("amount", fl(80.0))]), &cx0, w as usize, h as usize).expect("tint");
+    let cases: Vec<(&str, Vec<FxOp>, FlatMask)> = vec![
+        ("blur, feathered edge band", vec![blur.clone()], band(60.0, 20.0, false)),
+        ("tint, hard inverted band", vec![tint.clone()], band(30.0, 0.0, true)),
+        ("tint then blur", vec![tint.clone(), blur.clone()], band(48.0, 30.0, false)),
+    ];
+    for (name, inner, mask) in cases {
+        let cov = coverage(&[mask], w as usize, h as usize).expect("coverage");
+        let op = FxOp::Masked { ops: inner, cov: std::sync::Arc::new(cov), w, h };
+        assert!(op.gpu_ok(), "{name}: not GPU-capable");
+        let mut cpu = filmcraft_render::Image { w: w as usize, h: h as usize, px: px.clone() };
+        op.apply(&mut cpu);
+        // before the masked op and after it, so the original it keeps is a middle image
+        let ops = vec![FxOp::BrightnessContrast { br: 0.05, co: 1.1 }, op];
+        let mut cpu2 = filmcraft_render::Image { w: w as usize, h: h as usize, px: px.clone() };
+        for o in &ops {
+            o.apply(&mut cpu2);
+        }
+        let (_, _, gpu) = c.effect_image(&frame, &LayerFx { size: (w, h), decimation: 1, ops }).expect("effect image");
+        let (worst, flips) = compare(&cpu2.px, &gpu);
+        eprintln!("{name}: max rel diff {worst:.2e}, {:.3}% flipped", flips * 100.0);
+        assert!(worst < EXACT * 2.0 && flips == 0.0, "{name}: {worst}, {flips}");
+        // the blur really limited itself to its band: the left of the picture is untouched
+        let mut plain = filmcraft_render::Image { w: w as usize, h: h as usize, px: px.clone() };
+        FxOp::BrightnessContrast { br: 0.05, co: 1.1 }.apply(&mut plain);
+        let px_at = |img: &[f32], x: usize, y: usize| img[(y * w as usize + x) * 4..(y * w as usize + x) * 4 + 4].to_vec();
+        if name.starts_with("blur") {
+            assert_eq!(
+                px_at(&gpu, 4, 20).iter().map(|v| (v * 1e4).round()).collect::<Vec<_>>(),
+                px_at(&plain.px, 4, 20).iter().map(|v| (v * 1e4).round()).collect::<Vec<_>>()
+            );
+        }
+    }
+}

@@ -85,8 +85,8 @@ fn simple_transition(id: &str) -> bool {
 }
 
 /// The standard effects of a media clip if the GPU can draw it (any blend mode, no opacity masks,
-/// every enabled standard effect unmasked and with a GPU implementation; empty without effects or
-/// with effects off). None: the clip is rendered on the CPU.
+/// every enabled standard effect with a GPU implementation, masked or not; empty without effects
+/// or with effects off). None: the clip is rendered on the CPU.
 fn gpu_chain<'a>(project: &Project, item: &'a TrackItem, opts: RenderOptions) -> Option<Vec<&'a filmcraft_project::EffectInstance>> {
     let is_media = project.item(item.item).is_some_and(|p| matches!(p.kind, ItemKind::Media(_) | ItemKind::Subclip { .. }));
     if !is_media || item.has_opacity_masks() {
@@ -100,8 +100,8 @@ fn gpu_chain<'a>(project: &Project, item: &'a TrackItem, opts: RenderOptions) ->
         if !e.enabled {
             continue;
         }
-        let masked = e.masks.iter().any(|m| m.mode != filmcraft_project::MaskMode::None);
-        if masked || !(crate::gpufx::GPU_EFFECTS.contains(&e.effect.as_str()) || e.effect == "lumetri") {
+        // (masked effects run on the GPU too: `gpu_ops` wraps them in `FxOp::Masked`)
+        if !(crate::gpufx::GPU_EFFECTS.contains(&e.effect.as_str()) || e.effect == "lumetri") {
             return None;
         }
         chain.push(e);
@@ -290,6 +290,30 @@ fn push_item(
     let mt = item.effect_time_at(t);
     let (op, own) = crate::opacity_blend(item, mt);
     let bl = blend.unwrap_or(own);
+    // A multi-camera clip showing an angle with standard effects and / or a Motion (a grade, a
+    // blur, a push-in): the angle's clip is drawn on the GPU through the multi-camera clip's
+    // effects and Motion, with no CPU pass over the nested sequence. The nested frame size must be
+    // this sequence's, so the nested canvas is the clip's own picture.
+    if let Some(ItemKind::Sequence(nested)) = project.item(item.item).map(|p| &p.kind)
+        && nest < crate::MAX_NEST_DEPTH
+        && let Some(angle) = item.multicam_angle(nested)
+        && (nested.settings.width, nested.settings.height) == (seq.settings.width, seq.settings.height)
+        && let outer_motion = motion_matrix(seq, item, (nested.settings.width, nested.settings.height), mt)
+        && ((opts.effects && item.has_standard_effects()) || !near_identity(&outer_motion))
+        && !item.has_opacity_masks()
+        && let Some(effects) = gpu_effects(item, opts)
+        && let Some(tr) = nested.angle_video_track_index(angle).and_then(|i| nested.video_tracks.get(i))
+        && !tr.transitions.iter().any(|x| x.range().contains(ft))
+        && let Some(inner) = tr.item_at(ft).filter(|i| i.enabled)
+        && crate::opacity_blend(inner, inner.effect_time_at(ft)).1 != Blend::Dissolve
+    {
+        let outer = Outer { item, motion: outer_motion, effects, t, mt };
+        let blend_inner = bl;
+        match push_media_gpu(project, nested, inner, ft, opts, sources, extra_opacity * op, blend_inner, Some(&outer), out) {
+            Gpu::Drawn | Gpu::Nothing => return,
+            Gpu::Fallback => {}
+        }
+    }
     // A multi-camera clip that only shows its angle (no effects, untransformed, same frame size)
     // draws the angle's clip directly: no CPU pass over the nested sequence.
     if let Some(ItemKind::Sequence(nested)) = project.item(item.item).map(|p| &p.kind)
@@ -348,65 +372,172 @@ fn push_item(
         }
         return;
     }
-    if let Some(chain) = gpu_chain(project, item, opts) {
-        let Some(src) = sources.source(item.item) else { return };
-        let Some(size) = crate::source_size(project, item.item) else { return };
-        let motion = motion_matrix(seq, item, size, mt);
-        let lin = ((motion.a * motion.a + motion.b * motion.b).sqrt()).max((motion.c * motion.c + motion.d * motion.d).sqrt());
-        let want = (lin * opts.scale as f64).clamp(1.0 / 64.0, 1.0) as f32;
-        let Ok(frame) = src.video_frame(FrameRequest { time: ft, scale: want }) else { return };
-        let cs = crate::colorman::source_space(project, item.item, &frame);
-        // log / HDR / wide-gamut media is converted on the CPU (below), and so are blended
-        // in-between frames (Frame Blending / Optical Flow on speed-changed clips)
-        let plain =
-            !crate::colorman::needs_management(&seq.settings.color, cs, &frame) && crate::interpolation_blend(item, t, src.info().frame_rate()).is_none();
-        if plain && !chain.is_empty() {
-            // GPU effect stage: the working image the CPU would decode (`base_layer`), the
-            // effects evaluated for it, placed as `item_layer` places it
-            let n = crate::decimation(frame.width as f32, size.0 as f32 * want);
-            let (lw, lh) = ((frame.width as usize / n).max(1), (frame.height as usize / n).max(1));
-            let px_scale = lw as f32 / size.0.max(1) as f32;
-            let tc = "";
-            let cx = crate::effects::FxCtx {
-                t: mt,
-                px_scale,
-                seconds: (t - item.start).seconds(),
-                timecode: tc,
-                clip_name: &item.name,
-                project: Some(project),
-                env: None,
-                working: seq.settings.color.working,
-            };
-            let ops: Option<Vec<FxOp>> = chain.iter().map(|e| crate::gpufx::gpu_ops(e, &cx, lw, lh)).collect::<Option<Vec<_>>>().map(|v| v.concat());
-            if let Some(ops) = ops {
-                let m = Affine::scale(opts.scale as f64, opts.scale as f64)
-                    .then_apply(&motion)
-                    .then_apply(&Affine::scale(1.0 / px_scale as f64, 1.0 / px_scale as f64));
-                let fx = LayerFx { size: (lw as u32, lh as u32), decimation: n as u32, ops };
-                out.push(PlanLayer { frame, matrix: m, opacity: op * extra_opacity, blend: bl, fx: Some(Arc::new(fx)), adjust: false });
-                return;
-            }
-        } else if plain {
-            // Draft playback at reduced resolution: hand over planes box-filtered to the size
-            // drawn instead of the full picture (a quarter at 1/2, a sixteenth at 1/4 of the
-            // upload and sampling). The mean is taken over Y'CbCr codes, not linear light as
-            // the shader's supersampling does, so this stays limited to the opt-in draft mode.
-            let n = if filmcraft_media::cancel::draft() { crate::decimation(frame.width as f32, size.0 as f32 * want) } else { 1 };
-            let frame = match frame.box_decimated(n) {
-                Some(small) => Arc::new(small),
-                None => frame,
-            };
-            let px_scale = frame.width as f64 / size.0.max(1) as f64;
-            let m = Affine::scale(opts.scale as f64, opts.scale as f64).then_apply(&motion).then_apply(&Affine::scale(1.0 / px_scale, 1.0 / px_scale));
-            out.push(PlanLayer::new(frame, m, op * extra_opacity, bl));
-            return;
-        }
+    match push_media_gpu(project, seq, item, t, opts, sources, extra_opacity, bl, None, out) {
+        Gpu::Drawn | Gpu::Nothing => return,
+        Gpu::Fallback => {}
     }
     // CPU-rendered layer (standard effects): drawn by the GPU as a pre-rendered canvas image.
     let tc = filmcraft_time::format_time(t, seq.settings.frame_rate, seq.settings.drop_frame, filmcraft_time::TimeDisplay::Timecode, 48_000);
     if let Some((img, op2, _)) = crate::item_layer(project, seq, item, t, opts, sources, &tc) {
         out.push(PlanLayer::new(cpu_frame(img), Affine::IDENTITY, op2 * extra_opacity, bl));
     }
+}
+
+/// What [`push_media_gpu`] did.
+enum Gpu {
+    /// Its layer was pushed.
+    Drawn,
+    /// There is nothing to draw (the source or its frame is not there).
+    Nothing,
+    /// The GPU cannot draw it: render it on the CPU.
+    Fallback,
+}
+
+/// The multi-camera clip around a media clip that [`push_media_gpu`] draws for it: the clip's
+/// Motion (nested picture → this sequence), and its standard effects with the time they are
+/// evaluated at.
+struct Outer<'a> {
+    item: &'a TrackItem,
+    motion: Affine,
+    effects: Vec<&'a filmcraft_project::EffectInstance>,
+    /// Timeline time of the multi-camera clip (its effects and name context).
+    t: Tick,
+    /// Effect time of the multi-camera clip.
+    mt: Tick,
+}
+
+/// The standard effects of `item` (any clip) when each has a GPU implementation (masked or not).
+fn gpu_effects(item: &TrackItem, opts: RenderOptions) -> Option<Vec<&filmcraft_project::EffectInstance>> {
+    if item.has_opacity_masks() {
+        return None;
+    }
+    let mut chain = Vec::new();
+    if !opts.effects {
+        return Some(chain);
+    }
+    for e in item.effects.iter().filter(|e| e.def().is_some_and(|d| !d.intrinsic) && !filmcraft_project::graphic::is_layer(e)) {
+        if !e.enabled {
+            continue;
+        }
+        if !(crate::gpufx::GPU_EFFECTS.contains(&e.effect.as_str()) || e.effect == "lumetri") {
+            return None;
+        }
+        chain.push(e);
+    }
+    Some(chain)
+}
+
+/// Draw a media clip on the GPU: its decoded frame placed by its Motion, through its standard
+/// effects evaluated for the working image (the GPU effect stage), like the CPU's `item_layer`.
+/// `outer` is the multi-camera clip showing it as an angle: its effects follow the clip's own and
+/// its Motion places the picture.
+fn push_media_gpu(
+    project: &Project,
+    seq: &Sequence,
+    item: &TrackItem,
+    t: Tick,
+    opts: RenderOptions,
+    sources: &dyn SourceProvider,
+    extra_opacity: f32,
+    bl: Blend,
+    outer: Option<&Outer>,
+    out: &mut Vec<PlanLayer>,
+) -> Gpu {
+    let Some(own) = gpu_chain(project, item, opts) else { return Gpu::Fallback };
+    let mt = item.effect_time_at(t);
+    let ft = item.source_time_at(t);
+    let (op, _) = crate::opacity_blend(item, mt);
+    let Some(src) = sources.source(item.item) else { return Gpu::Nothing };
+    let Some(size) = crate::source_size(project, item.item) else { return Gpu::Nothing };
+    let inner_motion = motion_matrix(seq, item, size, mt);
+    // through an outer multi-camera clip: its effects work on the clip's picture, which is the
+    // canvas only while the clip fills it
+    if outer.is_some_and(|o| !o.effects.is_empty()) && !near_identity(&inner_motion) {
+        return Gpu::Fallback;
+    }
+    let full = match outer {
+        Some(o) => o.motion.then_apply(&inner_motion),
+        None => inner_motion,
+    };
+    let lin = ((full.a * full.a + full.b * full.b).sqrt()).max((full.c * full.c + full.d * full.d).sqrt());
+    let want = (lin * opts.scale as f64).clamp(1.0 / 64.0, 1.0) as f32;
+    let Ok(frame) = src.video_frame(FrameRequest { time: ft, scale: want }) else { return Gpu::Nothing };
+    let cs = crate::colorman::source_space(project, item.item, &frame);
+    // log / HDR / wide-gamut media is converted on the CPU
+    if crate::colorman::needs_management(&seq.settings.color, cs, &frame) {
+        return Gpu::Fallback;
+    }
+    // Frame Blending / Optical Flow (renders as blending) of a speed-changed clip: the frame and
+    // the next one, drawn one over the other at the blend weight — in linear light, over an
+    // opaque picture exactly the CPU's `lerp` of the two
+    let second = crate::interpolation_blend(item, t, src.info().frame_rate()).and_then(|(next, w)| {
+        let f2 = src.video_frame(FrameRequest { time: next, scale: want }).ok()?;
+        (f2.width == frame.width && f2.height == frame.height && w > 1e-4).then_some((f2, w.clamp(0.0, 1.0)))
+    });
+    let opacity = op * extra_opacity;
+    let chain_len = own.len() + outer.map_or(0, |o| o.effects.len());
+    if chain_len > 0 {
+        // GPU effect stage: the working image the CPU would decode (`base_layer`), the effects
+        // evaluated for it, placed as `item_layer` places it
+        let n = crate::decimation(frame.width as f32, size.0 as f32 * want);
+        let (lw, lh) = ((frame.width as usize / n).max(1), (frame.height as usize / n).max(1));
+        let px_scale = lw as f32 / size.0.max(1) as f32;
+        let mut ops = Vec::new();
+        let own_cx = crate::effects::FxCtx {
+            t: mt,
+            px_scale,
+            seconds: (t - item.start).seconds(),
+            timecode: "",
+            clip_name: &item.name,
+            project: Some(project),
+            env: None,
+            working: seq.settings.color.working,
+        };
+        for e in &own {
+            let Some(v) = crate::gpufx::gpu_ops(e, &own_cx, lw, lh) else { return Gpu::Fallback };
+            ops.extend(v);
+        }
+        if let Some(o) = outer {
+            let ocx = crate::effects::FxCtx {
+                t: o.mt,
+                px_scale,
+                seconds: (o.t - o.item.start).seconds(),
+                timecode: "",
+                clip_name: &o.item.name,
+                project: Some(project),
+                env: None,
+                working: seq.settings.color.working,
+            };
+            for e in &o.effects {
+                let Some(v) = crate::gpufx::gpu_ops(e, &ocx, lw, lh) else { return Gpu::Fallback };
+                ops.extend(v);
+            }
+        }
+        let m = Affine::scale(opts.scale as f64, opts.scale as f64).then_apply(&full).then_apply(&Affine::scale(1.0 / px_scale as f64, 1.0 / px_scale as f64));
+        let fx = Arc::new(LayerFx { size: (lw as u32, lh as u32), decimation: n as u32, ops });
+        out.push(PlanLayer { frame, matrix: m, opacity, blend: bl, fx: Some(fx.clone()), adjust: false });
+        if let Some((f2, w)) = second {
+            out.push(PlanLayer { frame: f2, matrix: m, opacity: opacity * w, blend: bl, fx: Some(fx), adjust: false });
+        }
+        return Gpu::Drawn;
+    }
+    // Draft playback at reduced resolution: hand over planes box-filtered to the size drawn
+    // instead of the full picture (a quarter at 1/2, a sixteenth at 1/4 of the upload and
+    // sampling). The mean is taken over Y'CbCr codes, not linear light as the shader's
+    // supersampling does, so this stays limited to the opt-in draft mode.
+    let n = if filmcraft_media::cancel::draft() { crate::decimation(frame.width as f32, size.0 as f32 * want) } else { 1 };
+    let shrink = |f: Arc<VideoFrame>| match f.box_decimated(n) {
+        Some(small) => Arc::new(small),
+        None => f,
+    };
+    let frame = shrink(frame);
+    let px_scale = frame.width as f64 / size.0.max(1) as f64;
+    let m = Affine::scale(opts.scale as f64, opts.scale as f64).then_apply(&full).then_apply(&Affine::scale(1.0 / px_scale, 1.0 / px_scale));
+    out.push(PlanLayer::new(frame, m, opacity, bl));
+    if let Some((f2, w)) = second {
+        out.push(PlanLayer::new(shrink(f2), m, opacity * w, bl));
+    }
+    Gpu::Drawn
 }
 
 fn near_identity(m: &Affine) -> bool {
