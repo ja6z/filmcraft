@@ -41,6 +41,10 @@ pub struct PlanLayer {
     /// An adjustment layer: `fx` runs on the picture composited so far (sized `fx.size`, the
     /// output) instead of on `frame`, and the result is drawn over it at the identity matrix.
     pub adjust: bool,
+    /// Composite on display-encoded values (a Cross Dissolve with Mix Display Values): the
+    /// opacity mix and the blend run on sRGB-encoded straight colour, like
+    /// [`crate::blend::composite_in`] with `linear` off.
+    pub encoded: bool,
 }
 
 /// The GPU effect stage of a layer: the frame is decoded into a working image of `size` (the
@@ -56,7 +60,7 @@ pub struct LayerFx {
 impl PlanLayer {
     /// A layer drawing `frame` directly.
     pub fn new(frame: Arc<VideoFrame>, matrix: Affine, opacity: f32, blend: Blend) -> Self {
-        Self { frame, matrix, opacity, blend, fx: None, adjust: false }
+        Self { frame, matrix, opacity, blend, fx: None, adjust: false, encoded: false }
     }
 
     /// Size of the picture the matrix places: the working image with effects, else the frame.
@@ -222,11 +226,18 @@ fn push_tracks(project: &Project, seq: &Sequence, t: Tick, opts: RenderOptions, 
                 }
                 _ => {
                     // cross dissolve: A at full, B over it at p (premultiplied over == linear mix when A is opaque)
+                    let first = layers.len();
                     if let Some(it) = a {
                         push_item(project, seq, it, t, opts, sources, 1.0 - if b.is_none() { p } else { 0.0 }, Some(Blend::Normal), nest, layers);
                     }
                     if let Some(it) = b {
                         push_item(project, seq, it, t, opts, sources, p, Some(Blend::Normal), nest, layers);
+                    }
+                    // Mix Display Values: the same over, on display-encoded values
+                    if crate::transitions::display_mix(&trn.effect) {
+                        for l in &mut layers[first..] {
+                            l.encoded = true;
+                        }
                     }
                 }
             }
@@ -244,7 +255,7 @@ fn push_tracks(project: &Project, seq: &Sequence, t: Tick, opts: RenderOptions, 
             {
                 let (op, bl) = crate::opacity_blend(item, item.effect_time_at(t));
                 let blank = Arc::new(VideoFrame::rgba_f32(1, 1, vec![0.0; 4]));
-                layers.push(PlanLayer { frame: blank, matrix: Affine::IDENTITY, opacity: op, blend: bl, fx: Some(Arc::new(fx)), adjust: true });
+                layers.push(PlanLayer { frame: blank, matrix: Affine::IDENTITY, opacity: op, blend: bl, fx: Some(Arc::new(fx)), adjust: true, encoded: false });
             }
             continue;
         }
@@ -515,9 +526,9 @@ fn push_media_gpu(
         }
         let m = Affine::scale(opts.scale as f64, opts.scale as f64).then_apply(&full).then_apply(&Affine::scale(1.0 / px_scale as f64, 1.0 / px_scale as f64));
         let fx = Arc::new(LayerFx { size: (lw as u32, lh as u32), decimation: n as u32, ops });
-        out.push(PlanLayer { frame, matrix: m, opacity, blend: bl, fx: Some(fx.clone()), adjust: false });
+        out.push(PlanLayer { frame, matrix: m, opacity, blend: bl, fx: Some(fx.clone()), adjust: false, encoded: false });
         if let Some((f2, w)) = second {
-            out.push(PlanLayer { frame: f2, matrix: m, opacity: opacity * w, blend: bl, fx: Some(fx), adjust: false });
+            out.push(PlanLayer { frame: f2, matrix: m, opacity: opacity * w, blend: bl, fx: Some(fx), adjust: false, encoded: false });
         }
         return Gpu::Drawn;
     }
@@ -580,7 +591,7 @@ pub fn execute_cpu(plan: &FramePlan) -> crate::Image {
                 } else {
                     src.transformed(*width, *height, &l.matrix)
                 };
-                crate::blend::composite(&mut canvas, &placed, l.opacity, l.blend);
+                crate::blend::composite_in(&mut canvas, &placed, l.opacity, l.blend, !l.encoded);
             }
             canvas
         }

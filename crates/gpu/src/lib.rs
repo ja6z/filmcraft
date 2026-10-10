@@ -624,13 +624,14 @@ impl GpuCompositor {
                     blend: Blend::Normal,
                     fx: None,
                     adjust: false,
+                    encoded: false,
                 }];
                 (img.w as u32, img.h as u32, &owned[..])
             }
         };
         let (w, h) = (w.max(1), h.max(1));
         let accum_view = Self::target(&self.device, &mut self.accum, w, h, ACCUM_FORMAT, wgpu::TextureUsages::COPY_SRC);
-        let backdrop_view = if layers.iter().any(|l| l.blend.reads_destination()) {
+        let backdrop_view = if layers.iter().any(reads_destination) {
             Some(Self::target(&self.device, &mut self.backdrop, w, h, ACCUM_FORMAT, wgpu::TextureUsages::COPY_DST))
         } else {
             None
@@ -732,7 +733,7 @@ impl GpuCompositor {
             let (u, tex) = match &job {
                 Some(j) => {
                     let s = SrcInfo { kind: 1, code_scale: 1.0, alpha: 0.0, chroma: l.size(), size: l.size(), color: l.frame.color };
-                    (Self::uniforms(&s, &l.matrix, l.opacity, l.blend, (w, h)), [j.result.clone(), self.dummy.clone(), self.dummy.clone(), self.dummy.clone()])
+                    (encoded(Self::uniforms(&s, &l.matrix, l.opacity, l.blend, (w, h)), l), [j.result.clone(), self.dummy.clone(), self.dummy.clone(), self.dummy.clone()])
                 }
                 None if l.adjust => (Self::uniforms(&src, &l.matrix, 0.0, l.blend, (w, h)), views),
                 None => {
@@ -746,7 +747,7 @@ impl GpuCompositor {
                         }
                         None => l.matrix,
                     };
-                    (Self::uniforms(&src, &m, l.opacity, l.blend, (w, h)), views)
+                    (encoded(Self::uniforms(&src, &m, l.opacity, l.blend, (w, h)), l), views)
                 }
             };
             jobs.push(job);
@@ -758,7 +759,7 @@ impl GpuCompositor {
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&tex[2]) },
                 wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&tex[3]) },
             ];
-            let (layout, region) = match (&backdrop_view, l.blend.reads_destination()) {
+            let (layout, region) = match (&backdrop_view, reads_destination(l)) {
                 (Some(b), true) => {
                     entries.push(wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(b) });
                     (&self.blend_bgl, Some(quad_bounds(l, w, h)))
@@ -1013,6 +1014,18 @@ fn accum_pass<'e>(enc: &'e mut wgpu::CommandEncoder, view: &wgpu::TextureView, l
         occlusion_query_set: None,
         multiview_mask: None,
     })
+}
+
+/// Whether a layer is drawn by `fs_blend` (reads the accumulator under it): blend modes other
+/// than Normal / Dissolve, and layers composited on display-encoded values.
+fn reads_destination(l: &PlanLayer) -> bool {
+    l.blend.reads_destination() || l.encoded
+}
+
+/// Layer uniforms with `p3.z` = composite on display-encoded values ([`PlanLayer::encoded`]).
+fn encoded(mut u: [f32; 28], l: &PlanLayer) -> [f32; 28] {
+    u[26] = if l.encoded { 1.0 } else { 0.0 };
+    u
 }
 
 /// The output pixels a layer's quad can touch, as (x, y, width, height) clamped to the `w`×`h`

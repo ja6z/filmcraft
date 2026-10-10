@@ -162,8 +162,8 @@ fn gpu_blend_modes_match_cpu() {
             layers: vec![
                 // opaque YUV on the left, a partially transparent ramp on the right; the top-right
                 // corner stays empty (destination alpha 0)
-                PlanLayer { frame: yuv_frame(640, 360), matrix: Affine::scale(0.35, 0.5), opacity: 1.0, blend: Blend::Normal, fx: None, adjust: false },
-                PlanLayer { frame: base.clone(), matrix: Affine::translate(200.0, 40.0), opacity: 0.9, blend: Blend::Normal, fx: None, adjust: false },
+                PlanLayer { frame: yuv_frame(640, 360), matrix: Affine::scale(0.35, 0.5), opacity: 1.0, blend: Blend::Normal, fx: None, adjust: false, encoded: false },
+                PlanLayer { frame: base.clone(), matrix: Affine::translate(200.0, 40.0), opacity: 0.9, blend: Blend::Normal, fx: None, adjust: false, encoded: false },
                 PlanLayer {
                     frame: top.clone(),
                     matrix: Affine::motion(Vec2::new(170.0, 95.0), Vec2::new(1.1, 1.1), 17.0, Vec2::new(80.0, 60.0)),
@@ -171,6 +171,7 @@ fn gpu_blend_modes_match_cpu() {
                     blend: mode,
                     fx: None,
                     adjust: false,
+                    encoded: false,
                 },
                 PlanLayer {
                     frame: demo.clone(),
@@ -179,6 +180,7 @@ fn gpu_blend_modes_match_cpu() {
                     blend: mode,
                     fx: None,
                     adjust: false,
+                    encoded: false,
                 },
             ],
         };
@@ -237,8 +239,8 @@ fn gpu_blend_edge_cases_match_cpu() {
                 width: n,
                 height: n,
                 layers: vec![
-                    PlanLayer { frame: back.clone(), matrix: Affine::IDENTITY, opacity: 1.0, blend: Blend::Normal, fx: None, adjust: false },
-                    PlanLayer { frame: src.clone(), matrix: Affine::IDENTITY, opacity, blend: mode, fx: None, adjust: false },
+                    PlanLayer { frame: back.clone(), matrix: Affine::IDENTITY, opacity: 1.0, blend: Blend::Normal, fx: None, adjust: false, encoded: false },
+                    PlanLayer { frame: src.clone(), matrix: Affine::IDENTITY, opacity, blend: mode, fx: None, adjust: false, encoded: false },
                 ],
             };
             let cpu = execute_cpu(&plan);
@@ -278,8 +280,8 @@ fn gpu_dissolve_pattern_is_exact() {
             width: w,
             height: h,
             layers: vec![
-                PlanLayer { frame: red.clone(), matrix: Affine::scale(w as f64, h as f64), opacity: 1.0, blend: Blend::Normal, fx: None, adjust: false },
-                PlanLayer { frame: white.clone(), matrix: Affine::scale(w as f64, h as f64), opacity: op, blend: Blend::Dissolve, fx: None, adjust: false },
+                PlanLayer { frame: red.clone(), matrix: Affine::scale(w as f64, h as f64), opacity: 1.0, blend: Blend::Normal, fx: None, adjust: false, encoded: false },
+                PlanLayer { frame: white.clone(), matrix: Affine::scale(w as f64, h as f64), opacity: op, blend: Blend::Dissolve, fx: None, adjust: false, encoded: false },
             ],
         };
         let cpu = execute_cpu(&plan).over_black_rgba8();
@@ -305,7 +307,7 @@ fn normal_fast_path_and_blend_layers_off_output() {
     };
     let mut c = GpuCompositor::new(&dev, &q);
     let grey = Arc::new(VideoFrame::rgba_f32(4, 4, vec![0.2; 64]));
-    let layer = |m: Affine, blend: Blend| PlanLayer { frame: grey.clone(), matrix: m, opacity: 1.0, blend, fx: None, adjust: false };
+    let layer = |m: Affine, blend: Blend| PlanLayer { frame: grey.clone(), matrix: m, opacity: 1.0, blend, fx: None, adjust: false, encoded: false };
     let normal = FramePlan::Layers { width: 32, height: 16, layers: vec![layer(Affine::scale(8.0, 4.0), Blend::Normal)] };
     c.composite(&normal);
     assert!(c.backdrop.is_none());
@@ -338,10 +340,72 @@ fn quad_bounds_clamps_and_handles_non_finite() {
         blend: Blend::Screen,
         fx: None,
         adjust: false,
+        encoded: false,
     };
     assert_eq!(quad_bounds(&l(Affine::translate(5.0, 5.0)), 100, 100), Some((4, 4, 12, 12)));
     assert_eq!(quad_bounds(&l(Affine::translate(-5.0, 95.0)), 100, 100), Some((0, 94, 6, 6)));
     assert_eq!(quad_bounds(&l(Affine::translate(f64::NAN, 0.0)), 100, 100), Some((0, 0, 100, 100)));
     assert_eq!(quad_bounds(&l(Affine::scale(f64::INFINITY, 1.0)), 100, 100), Some((0, 0, 100, 100)));
     assert_eq!(quad_bounds(&l(Affine::translate(-50.0, 0.0)), 100, 100), None);
+}
+
+/// A layer composited on display-encoded values (`PlanLayer::encoded`, a Cross Dissolve with Mix
+/// Display Values) matches the CPU's encoded compositing (`composite_in`, linear off), for Normal
+/// and a couple of blend modes, at full and partial opacity, on exact inputs drawn 1:1.
+#[test]
+fn gpu_encoded_layers_match_cpu() {
+    let Some((dev, q)) = device() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let vals = [0.0f32, 1.0, 0.5, 0.25, 0.75, 0.125, 0.875, 0.0625];
+    let alphas = [1.0f32, 0.5, 0.0, 0.25];
+    let n = vals.len() * alphas.len();
+    let make = |along_x: bool| {
+        let mut px = Vec::with_capacity(n * n * 4);
+        for y in 0..n {
+            for x in 0..n {
+                let (i, o) = if along_x { (x, y) } else { (y, x) };
+                let (v, a) = (i % vals.len(), alphas[i / vals.len()]);
+                let j = o % 3;
+                let c = [vals[v], vals[(v + j) % vals.len()], vals[(v + 2 * j) % vals.len()]];
+                px.extend_from_slice(&[c[0] * a, c[1] * a, c[2] * a, a]);
+            }
+        }
+        Arc::new(VideoFrame::rgba_f32(n as u32, n as u32, px))
+    };
+    let (back, src) = (make(true), make(false));
+    let mut c = GpuCompositor::new(&dev, &q);
+    for mode in [Blend::Normal, Blend::Multiply, Blend::Screen] {
+        for opacity in [1.0f32, 0.5, 0.2] {
+            let plan = FramePlan::Layers {
+                width: n,
+                height: n,
+                layers: vec![
+                    PlanLayer { frame: back.clone(), matrix: Affine::IDENTITY, opacity: 1.0, blend: Blend::Normal, fx: None, adjust: false, encoded: false },
+                    PlanLayer { frame: src.clone(), matrix: Affine::IDENTITY, opacity, blend: mode, fx: None, adjust: false, encoded: true },
+                ],
+            };
+            let cpu = execute_cpu(&plan);
+            c.composite(&plan);
+            let gpu = read_accum(&c);
+            let worst = cpu.px.iter().zip(&gpu).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            eprintln!("encoded {mode:?} @ {opacity}: max |cpu − gpu| = {worst:.2e}");
+            assert!(worst < 3e-3, "encoded {mode:?} @ {opacity}: {worst}");
+        }
+    }
+    // and it is not the linear result: 50 % white over black is half the display value
+    let black = Arc::new(VideoFrame::rgba_f32(1, 1, vec![0.0, 0.0, 0.0, 1.0]));
+    let white = Arc::new(VideoFrame::rgba_f32(1, 1, vec![1.0; 4]));
+    let plan = FramePlan::Layers {
+        width: 4,
+        height: 4,
+        layers: vec![
+            PlanLayer::new(black, Affine::scale(4.0, 4.0), 1.0, Blend::Normal),
+            PlanLayer { encoded: true, ..PlanLayer::new(white, Affine::scale(4.0, 4.0), 0.5, Blend::Normal) },
+        ],
+    };
+    c.composite(&plan);
+    let v = read_accum(&c)[0];
+    assert!((filmcraft_color::linear_to_srgb(v) - 0.5).abs() < 4e-3, "{v}");
 }

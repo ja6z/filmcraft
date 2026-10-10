@@ -31,6 +31,7 @@ pub mod cards;
 mod dissolve;
 mod grunge;
 mod legacy;
+pub(crate) use legacy::display_mix;
 mod lights;
 mod motion;
 mod special;

@@ -362,3 +362,22 @@ fn contact_sheets() {
         sheet.save(std::path::Path::new(&dir).join(format!("{f}.png"))).unwrap();
     }
 }
+
+/// Cross Dissolve's Mix Display Values: halfway between black and white is half the display value
+/// (sRGB 0.5 ≈ 0.214 linear), not half the light; a one-sided fade keeps its colour at its share of
+/// alpha; off, the mix stays linear.
+#[test]
+fn cross_dissolve_mix_display_values() {
+    let def = filmcraft_project::find_effect("cross_dissolve").expect("cross dissolve");
+    let mut e = def.instance();
+    let black = Image::filled(4, 2, [0.0, 0.0, 0.0, 1.0]);
+    let white = Image::filled(4, 2, [1.0, 1.0, 1.0, 1.0]);
+    let linear = apply(&e, &black, &white, 0.5).get(1, 1);
+    assert!((linear[0] - 0.5).abs() < 1e-5, "{linear:?}");
+    e.params.get_mut("display_mix").expect("display_mix").value = ParamValue::Bool(true);
+    let enc = apply(&e, &black, &white, 0.5).get(1, 1);
+    assert!((filmcraft_color::linear_to_srgb(enc[0]) - 0.5).abs() < 1e-4 && enc[3] == 1.0, "{enc:?}");
+    let grey = Image::filled(4, 2, [0.2, 0.2, 0.2, 1.0]);
+    let fade = apply(&e, &grey, &Image::new(4, 2), 0.25).get(1, 1);
+    assert!((fade[0] - 0.15).abs() < 1e-5 && (fade[3] - 0.75).abs() < 1e-6, "{fade:?}");
+}

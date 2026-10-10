@@ -16,6 +16,33 @@ fn dir(e: &EffectInstance) -> u32 {
 }
 
 /// Mask-based mix: out = A·(1-m) + B·m with m = f(x, y) ∈ [0,1].
+/// Cross Dissolve's Mix Display Values.
+pub(crate) fn display_mix(e: &EffectInstance) -> bool {
+    e.effect == "cross_dissolve" && matches!(e.params.get("display_mix").map(|p| &p.value), Some(ParamValue::Bool(true)))
+}
+
+/// A at 1 - p and B at p, mixed on display-encoded (sRGB) straight colour with the alphas as
+/// weights (premultiplied linear in and out): between two opaque pictures the mix of their
+/// display values; with one side empty, the other at its share of alpha.
+pub(crate) fn encoded_mix(a: &Image, b: &Image, p: f32) -> Image {
+    use filmcraft_color::{linear_to_srgb, srgb_to_linear};
+    let mut out = Image::new(a.w, a.h);
+    out.px.par_chunks_mut(4).zip(a.px.par_chunks(4).zip(b.px.par_chunks(4))).for_each(|(o, (x, y))| {
+        let (wa, wb) = (x[3] * (1.0 - p), y[3] * p);
+        let ao = wa + wb;
+        if ao <= 0.0 {
+            return;
+        }
+        for c in 0..3 {
+            let ea = if x[3] > 0.0 { linear_to_srgb(x[c] / x[3]) } else { 0.0 };
+            let eb = if y[3] > 0.0 { linear_to_srgb(y[c] / y[3]) } else { 0.0 };
+            o[c] = srgb_to_linear(((ea * wa + eb * wb) / ao).clamp(0.0, 1.0)) * ao;
+        }
+        o[3] = ao;
+    });
+    out
+}
+
 fn masked(a: &Image, b: &Image, m: impl Fn(f32, f32) -> f32 + Sync) -> Image {
     let (w, h) = (a.w, a.h);
     let mut out = Image::new(w, h);
@@ -93,6 +120,7 @@ fn legacy(id: &str, e: &EffectInstance, a: &Image, b: &Image, p: f32) -> Image {
     let aspect = (a.w as f32) / (a.h as f32).max(1.0);
     let pd = p as f64;
     match id {
+        "cross_dissolve" if display_mix(e) => encoded_mix(a, b, p),
         "cross_dissolve" | "morph_cut" => masked(a, b, |_, _| p),
         "film_dissolve" => {
             // blend in a gamma-2.2-like space for a filmic, less-dippy dissolve

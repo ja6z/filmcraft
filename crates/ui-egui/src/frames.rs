@@ -884,7 +884,7 @@ fn plan_job(job: &Job, seq: ItemId, pool: &Arc<MediaPool>, services: &Arc<dyn Se
         let (w, h) = filmcraft_render::output_size(q, job.scale);
         let matrix = filmcraft_geom::Affine::scale(w as f64 / frame.width.max(1) as f64, h as f64 / frame.height.max(1) as f64);
         let mut layers =
-            vec![filmcraft_render::plan::PlanLayer { frame, matrix, opacity: 1.0, blend: filmcraft_render::Blend::Normal, fx: None, adjust: false }];
+            vec![filmcraft_render::plan::PlanLayer { frame, matrix, opacity: 1.0, blend: filmcraft_render::Blend::Normal, fx: None, adjust: false, encoded: false }];
         for o in filmcraft_render::caption_overlays(q, job.time, w, h) {
             layers.push(filmcraft_render::plan::PlanLayer {
                 frame: Arc::new(filmcraft_frame::VideoFrame::rgba_f32(o.w as u32, o.h as u32, o.px)),
@@ -893,6 +893,7 @@ fn plan_job(job: &Job, seq: ItemId, pool: &Arc<MediaPool>, services: &Arc<dyn Se
                 blend: filmcraft_render::Blend::Normal,
                 fx: None,
                 adjust: false,
+                encoded: false,
             });
         }
         return (filmcraft_render::plan::FramePlan::Layers { width: w, height: h, layers }, true);

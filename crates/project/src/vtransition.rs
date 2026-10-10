@@ -142,7 +142,10 @@ pub(crate) fn video_transition_defs() -> Vec<EffectDef> {
             m,
             vec![colour("burn_color", "Burn Color", [1.0, 0.45, 0.1, 1.0]), num("softness", "Softness", 25.0, 100.0, "%"), seed()],
         ),
-        tr("cross_dissolve", "Cross Dissolve", DISSOLVE, m, vec![]),
+        // Mix Display Values: mix the display-encoded (gamma) values instead of light — no hazy
+        // midpoint between a dark and a bright shot, and on log footage graded after the
+        // composite (an adjustment-layer LUT) no lifted blacks mid-dissolve.
+        tr("cross_dissolve", "Cross Dissolve", DISSOLVE, m, vec![b("display_mix", "Mix Display Values", false)]),
         tr("dip_to_black", "Dip to Black", DISSOLVE, m, vec![]),
         tr("dip_to_color", "Dip to Color", DISSOLVE, m, vec![colour("color", "Color", [0.85, 0.2, 0.2, 1.0]), num("hold", "Hold", 0.0, 90.0, "%")]),
         tr("dip_to_white", "Dip to White", DISSOLVE, m, vec![]),

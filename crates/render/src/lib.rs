@@ -143,7 +143,8 @@ pub(crate) fn render_seq_tracks(project: &Project, seq: &Sequence, t: Tick, opts
             } else {
                 transitions::apply_scaled(&tr.effect, &la, &lb, p, opts.scale)
             };
-            blend::composite_in(&mut canvas, &mixed, 1.0, Blend::Normal, seq.settings.composite_linear);
+            let linear = seq.settings.composite_linear && !transitions::display_mix(&tr.effect);
+            blend::composite_in(&mut canvas, &mixed, 1.0, Blend::Normal, linear);
             continue;
         }
         let Some(item) = track.item_at(t) else { continue };

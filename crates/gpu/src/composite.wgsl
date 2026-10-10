@@ -14,7 +14,7 @@ struct U {
     p0: vec4<f32>,   // opacity, kind (0 rgba8 srgb straight, 1 rgba16f premul linear, 2 yuv), taps, transfer (0 srgb, 1 linear, 2 pq, 3 hlg)
     p1: vec4<f32>,   // y_off y_scale c_off c_scale (code units)
     p2: vec4<f32>,   // kr kb code_scale footprint
-    p3: vec4<f32>,   // blend mode (index into filmcraft_render::Blend::ALL), alpha-plane scale (0: none), unused ×2
+    p3: vec4<f32>,   // blend mode (index into filmcraft_render::Blend::ALL), alpha-plane scale (0: none), display-encoded mix (1), unused
 };
 
 @group(0) @binding(0) var<uniform> u: U;
@@ -286,6 +286,20 @@ fn fs_blend(in: VOut) -> @location(0) vec4<f32> {
     let da = d.a;
     if da <= 0.0 {
         return sp + d * (1.0 - sa);
+    }
+    if u.p3.z > 0.5 {
+        // display-encoded compositing (`filmcraft_render::blend::composite_in`, linear off): the
+        // opacity mix and the blend on sRGB-encoded straight colour
+        let es = linear_to_srgb(sp.rgb / sa);
+        let eb = linear_to_srgb(d.rgb / da);
+        let mode = u32(u.p3.x);
+        var bl = es;
+        if mode > 1u {
+            bl = clamp(blend_rgb(mode, eb, es), vec3(0.0), vec3(1.0));
+        }
+        let ao = sa + da - sa * da;
+        let e = (es * sa * (1.0 - da) + eb * da * (1.0 - sa) + sa * da * bl) / ao;
+        return vec4(srgb_to_linear(clamp(e, vec3(0.0), vec3(1.0))) * ao, ao);
     }
     let cs = linear_to_srgb(sp.rgb / sa);
     let cb = linear_to_srgb(d.rgb / da);
