@@ -50,6 +50,9 @@ pub use wgpu;
 pub const OUTPUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const ACCUM_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
+/// Uploads kept between frames (more while one frame draws more layers than this).
+const UPLOAD_CACHE: usize = 24;
+
 struct Uploaded {
     /// Y, Cb, Cr (or the RGBA texture) and the alpha plane (the dummy texture when there is none).
     views: [wgpu::TextureView; 4],
@@ -79,6 +82,9 @@ pub struct GpuCompositor {
     backdrop: Option<(wgpu::Texture, wgpu::TextureView, (u32, u32))>,
     output: Option<(wgpu::Texture, wgpu::TextureView, (u32, u32))>,
     uploads: HashMap<(usize, u32, u32), Uploaded>,
+    /// [`Self::clock`] when the current composite started: uploads used since then belong to the
+    /// frame being drawn and are never evicted while it is drawn.
+    frame_clock: u64,
     clock: u64,
     dummy: wgpu::TextureView,
     /// The effect stage (None on devices without compute shaders or storage textures: layers
@@ -361,6 +367,7 @@ impl GpuCompositor {
             backdrop: None,
             output: None,
             uploads: HashMap::new(),
+            frame_clock: 0,
             clock: 0,
             dummy,
             fx,
@@ -514,15 +521,25 @@ impl GpuCompositor {
             }
         };
         self.uploads.insert(key, up);
-        // keep the most recent uploads (enough for several stacked layers + playback lookahead)
-        if self.uploads.len() > 24 {
-            let mut v: Vec<(u64, (usize, u32, u32))> = self.uploads.iter().map(|(k, u)| (u.last_used, *k)).collect();
-            v.sort_unstable();
-            for (_, k) in v.into_iter().take(self.uploads.len() - 24) {
-                self.uploads.remove(&k);
-            }
-        }
         key
+    }
+
+    /// Keep the most recent uploads (enough for several stacked layers + playback lookahead), but
+    /// never one the frame being drawn uses: trimming while a frame with more layers than the cache
+    /// holds was uploading evicted layers it was about to draw, so every layer was re-uploaded on
+    /// every frame (a 35-layer composite of stills took 52 ms a frame instead of 15).
+    fn trim_uploads(&mut self) {
+        if self.uploads.len() <= UPLOAD_CACHE {
+            return;
+        }
+        let frame = self.frame_clock;
+        let mut v: Vec<(u64, (usize, u32, u32))> =
+            self.uploads.iter().filter(|(_, u)| u.last_used <= frame).map(|(k, u)| (u.last_used, *k)).collect();
+        v.sort_unstable();
+        let excess = self.uploads.len() - UPLOAD_CACHE;
+        for (_, k) in v.into_iter().take(excess) {
+            self.uploads.remove(&k);
+        }
     }
 
     /// The source description of an uploaded frame.
@@ -630,6 +647,7 @@ impl GpuCompositor {
             }
         };
         let (w, h) = (w.max(1), h.max(1));
+        self.frame_clock = self.clock;
         let accum_view = Self::target(&self.device, &mut self.accum, w, h, ACCUM_FORMAT, wgpu::TextureUsages::COPY_SRC);
         let backdrop_view = if layers.iter().any(reads_destination) {
             Some(Self::target(&self.device, &mut self.backdrop, w, h, ACCUM_FORMAT, wgpu::TextureUsages::COPY_DST))
@@ -664,6 +682,7 @@ impl GpuCompositor {
                 self.upload(&l.frame, p)
             })
             .collect();
+        self.trim_uploads();
         // (bind group, None for a fixed-function layer or Some(region of the accumulator to copy
         // into the backdrop) for a layer that reads the destination; Some(None): off the output)
         let mut bind_groups = Vec::with_capacity(layers.len());
@@ -854,7 +873,9 @@ impl GpuCompositor {
     /// applied, read back as linear premultiplied RGBA f32 (what `LayerFx` ops produce on the
     /// CPU from the same frame). None when the working image does not fit in a texture.
     pub fn effect_image(&mut self, frame: &VideoFrame, fx: &filmcraft_render::plan::LayerFx) -> Option<(u32, u32, Vec<f32>)> {
+        self.frame_clock = self.clock;
         let key = self.upload(frame, None);
+        self.trim_uploads();
         let src = self.src_info(frame, key)?;
         let views = self.uploads.get(&key)?.views.clone();
         let n = fx.decimation.max(1) as f64;
